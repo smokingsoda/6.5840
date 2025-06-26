@@ -25,7 +25,7 @@ type Coordinator struct {
 	deleteCh chan int
 	tasks    map[int]HeartbeatMessage
 	// Lock-free file allocation channels
-	coordinatorInnerCh chan chan CoordinatorInnerRequest // Channel for worker file requests
+	coordinatorInnerCh chan chan CoordinatorInnerRequest // Channel for coordinator inner chan communication
 	availableFileIDs   chan int                          // Channel for available files
 	availableReduceIDs chan int                          // Channel for available ids
 
@@ -76,9 +76,7 @@ func (c *Coordinator) mapFileAllocator() {
 }
 
 func (c *Coordinator) reduceAllocator() {
-	// log.Printf("Not in reduce phase yet")
 	<-c.reduceStartCh // Wait for channel to be closed
-	// log.Printf("****************Now in reduce phase***************")
 	for {
 		select {
 		case responseCh := <-c.coordinatorInnerCh:
@@ -87,7 +85,7 @@ func (c *Coordinator) reduceAllocator() {
 				responseCh <- CoordinatorInnerRequest{"reduce", reduceID}
 				c.heartbeat <- HeartbeatMessage{TaskType: "reduce", TaskID: reduceID, SendTime: time.Now()}
 			case <-c.reduceDoneCh:
-				responseCh <- CoordinatorInnerRequest{"done", -1}
+				c.coordinatorInnerCh <- responseCh
 				return
 			}
 		case <-c.reduceDoneCh:
@@ -114,14 +112,12 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 		reply.TaskID = innerResponse.TaskID
 		reply.NReduce = c.nReduce
 		reply.MMap = c.mMap
-		// log.Printf("Assigned file %s to worker", reply.FileName)
 	case "reduce":
 		reply.TaskType = "reduce"
 		reply.FileName = ""
 		reply.TaskID = innerResponse.TaskID
 		reply.NReduce = c.nReduce
 		reply.MMap = c.mMap
-		// log.Printf("Assigned reduceID %d to worker", reply.TaskID)
 	default:
 		reply.TaskType = "done"
 		reply.TaskID = -1
@@ -143,25 +139,19 @@ func (c *Coordinator) ReplyDone(args *ReplyDoneArgs, reply *ReplyDoneReply) erro
 	case "map":
 		if c.mapCount >= c.mMap {
 			// All map tasks already completed, ignore duplicate completion
-			// log.Printf("[%s] Ignoring duplicate map task completion: TaskID=%d (Current count: %d/%d)", time.Now().Format("15:04:05.000"), args.TaskID, c.mapCount, c.mMap)
 			return nil
 		}
 		c.mapCount += 1
-		// log.Printf("[%s] Map task %d completed, count: %d/%d", time.Now().Format("15:04:05.000"), args.TaskID, c.mapCount, c.mMap)
 		if c.mapCount == c.mMap {
-			// log.Printf("All map tasks completed, starting reduce phase")
 			close(c.mapDoneCh)
 		}
 	case "reduce":
 		if c.reduceCount >= c.nReduce {
 			// All reduce tasks already completed, ignore duplicate completion
-			// log.Printf("[%s] Ignoring duplicate reduce task completion: TaskID=%d (Current count: %d/%d)", time.Now().Format("15:04:05.000"), args.TaskID, c.reduceCount, c.nReduce)
 			return nil
 		}
 		c.reduceCount += 1
-		// log.Printf("[%s] Reduce task completed, count: %d/%d", time.Now().Format("15:04:05.000"), c.reduceCount, c.nReduce)
 		if c.reduceCount == c.nReduce {
-			// log.Printf("All reduce tasks completed, closing done channel")
 			close(c.reduceDoneCh)
 			c.doneCh <- struct{}{}
 		}
@@ -178,7 +168,6 @@ func (c *Coordinator) HeartbeatManager() {
 	// Create timer to check timeout every TIMEOUT interval
 	ticker := time.NewTicker(TIMEOUT)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case h := <-c.heartbeat:
@@ -187,22 +176,9 @@ func (c *Coordinator) HeartbeatManager() {
 		case <-ticker.C:
 			// Timer triggered, check all tasks for timeout
 			curTime := time.Now()
-			// log.Printf("[%s] Checking heartbeat timeouts", curTime.Format("15:04:05.000"))
-
 			for taskID, lastHeartbeatMessage := range c.tasks {
 				// Skip zero time heartbeat records
-				// if lastHeartbeatMessage.SendTime.IsZero() {
-				// 	log.Printf("Skipping zero time heartbeat record: TaskType=%s, TaskID=%d",
-				// 		lastHeartbeatMessage.TaskType, lastHeartbeatMessage.TaskID)
-				// 	continue
-				// }
 				if curTime.Sub(lastHeartbeatMessage.SendTime) >= TIMEOUT {
-					// Detected timeout task, resend
-					// log.Printf("Detected task timeout, resending task: TaskType=%s, TaskID=%d, Last heartbeat: %s, Time since: %.1f seconds",
-					//	lastHeartbeatMessage.TaskType,
-					//	lastHeartbeatMessage.TaskID,
-					//	lastHeartbeatMessage.SendTime.Format("15:04:05.000"),
-					//	curTime.Sub(lastHeartbeatMessage.SendTime).Seconds())
 
 					switch lastHeartbeatMessage.TaskType {
 					case "map":
@@ -217,7 +193,6 @@ func (c *Coordinator) HeartbeatManager() {
 				}
 			}
 		case deleteID := <-c.deleteCh:
-			// log.Printf("[%s] Deleting completed task: TaskType=%s, TaskID=%d", time.Now().Format("15:04:05.000"), c.tasks[deleteID].TaskType, deleteID)
 			delete(c.tasks, deleteID)
 		}
 	}
@@ -250,7 +225,19 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	select {
 	case <-c.doneCh:
-		return true
+		// Set a timer to deal with some worker's request
+		// Send done message to them
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				return true
+			case responseCh := <-c.coordinatorInnerCh:
+				responseCh <- CoordinatorInnerRequest{"done", -1}
+			}
+		}
+
 	default:
 		return false
 	}
