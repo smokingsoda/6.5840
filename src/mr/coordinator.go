@@ -30,8 +30,9 @@ type Coordinator struct {
 	availableReduceIDs chan int                          // Channel for available ids
 
 	// counts
-	mapCount    int
-	reduceCount int
+	completedMapTaskMap    map[int]struct{}
+	completedReduceTaskMap map[int]struct{}
+	reduceCount            int
 
 	heartbeat chan HeartbeatMessage
 
@@ -153,26 +154,31 @@ func (c *Coordinator) ReplyDone(args *ReplyDoneArgs, reply *ReplyDoneReply) erro
 	// Check if this task completion should be counted
 	switch args.TaskType {
 	case "map":
-		if c.mapCount >= c.mMap {
-			// All map tasks already completed, ignore duplicate completion
+		// Check if tasked has been completed before
+		// First arrive as the first one to serve
+		if _, exists := c.completedMapTaskMap[args.TaskID]; exists {
+			// Completed task, ignore
 			Debug(dWarn, "Ignoring duplicate completion of map task %d", args.TaskID)
 			return nil
 		}
-		c.mapCount += 1
-		Debug(dMap, "Map task %d completed, progress: %d/%d", args.TaskID, c.mapCount, c.mMap)
-		if c.mapCount == c.mMap {
+		// Mark as completed
+		c.completedMapTaskMap[args.TaskID] = struct{}{}
+		Debug(dMap, "Map task %d completed, progress: %d/%d", args.TaskID, len(c.completedMapTaskMap), c.mMap)
+		if len(c.completedMapTaskMap) == c.mMap {
 			Debug(dCoordinator, "All map tasks completed!")
 			close(c.mapDoneCh)
 		}
 	case "reduce":
-		if c.reduceCount >= c.nReduce {
-			// All reduce tasks already completed, ignore duplicate completion
+		// Check if reduce task has been completed before
+		if _, exists := c.completedReduceTaskMap[args.TaskID]; exists {
+			// Completed task, ignore
 			Debug(dWarn, "Ignoring duplicate completion of reduce task %d", args.TaskID)
 			return nil
 		}
-		c.reduceCount += 1
-		Debug(dReduce, "Reduce task %d completed, progress: %d/%d", args.TaskID, c.reduceCount, c.nReduce)
-		if c.reduceCount == c.nReduce {
+		// Mark as completed
+		c.completedReduceTaskMap[args.TaskID] = struct{}{}
+		Debug(dReduce, "Reduce task %d completed, progress: %d/%d", args.TaskID, len(c.completedReduceTaskMap), c.nReduce)
+		if len(c.completedReduceTaskMap) == c.nReduce {
 			Debug(dCoordinator, "All reduce tasks completed! Job finished!")
 			close(c.reduceDoneCh)
 			c.doneCh <- struct{}{}
@@ -298,8 +304,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.heartbeat = make(chan HeartbeatMessage, max(c.mMap, c.nReduce))
 	c.idAndFileMap = make(map[int]string)
 	c.tasks = make(map[int]HeartbeatMessage)
-	c.mapCount = 0
-	c.reduceCount = 0
+	c.completedMapTaskMap = make(map[int]struct{})
+	c.completedReduceTaskMap = make(map[int]struct{})
 
 	// Put all files into available files channel
 	for idx, file := range files {
