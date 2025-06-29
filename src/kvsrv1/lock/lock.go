@@ -7,19 +7,14 @@ import (
 	kvtest "6.5840/kvtest1"
 )
 
-const (
-	LOCKED   = "locked"
-	UNLOCKED = "unlocked"
-)
-
 type Lock struct {
 	// IKVClerk is a go interface for k/v clerks: the interface hides
 	// the specific Clerk type of ck but promises that ck supports
 	// Put and Get.  The tester passes the clerk in when calling
 	// MakeLock().
-	ck          kvtest.IKVClerk
-	Name        string
-	LockVersion rpc.Tversion
+	ck       kvtest.IKVClerk
+	Name     string
+	ClientID string
 	// You may add code here
 }
 
@@ -31,9 +26,8 @@ type Lock struct {
 func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 	lk := &Lock{ck: ck, Name: l}
 	// You may add code here
-	lk.ck.Put(lk.Name, UNLOCKED, 0)
-	_, version, _ := lk.ck.Get(lk.Name)
-	lk.LockVersion = version
+	lk.ck.Put(lk.Name, "", 0)
+	lk.ClientID = kvtest.RandValue(8)
 	return lk
 }
 
@@ -44,10 +38,9 @@ func (lk *Lock) Acquire() {
 	for {
 		value, version, err := lk.ck.Get(lk.Name)
 		if err == rpc.OK {
-			if value == UNLOCKED {
-				err = lk.ck.Put(lk.Name, LOCKED, version)
+			if value == "" {
+				err = lk.ck.Put(lk.Name, lk.ClientID, version)
 				if err == rpc.OK {
-					lk.LockVersion = version + 1
 					return
 				}
 			}
@@ -59,10 +52,10 @@ func (lk *Lock) Acquire() {
 
 func (lk *Lock) Release() {
 	// Your code here
-	_, version, _ := lk.ck.Get(lk.Name)
-	if lk.LockVersion != version {
-		panic("version control failed")
+	value, version, _ := lk.ck.Get(lk.Name)
+	if lk.ClientID != value {
+		panic("failed to release the lock due to not requiring it before")
 	}
-	lk.ck.Put(lk.Name, UNLOCKED, lk.LockVersion)
+	lk.ck.Put(lk.Name, "", version)
 
 }
