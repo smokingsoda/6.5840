@@ -16,9 +16,8 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
-
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -29,9 +28,19 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
+	isleader bool
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm int
+	votedFor    int
 
+	// Inner chans for state switch
+	toCandidateCh       chan struct{}
+	candidateToLeaderCh chan struct{}
+	leaderToFollowerCh  chan struct{}
+
+	heartbeatCh chan struct{}
+	tickerCh    chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -41,6 +50,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	term = rf.currentTerm
+	isleader = rf.isleader
 	return term, isleader
 }
 
@@ -61,7 +72,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -90,7 +100,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -100,22 +109,97 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term        int
+	CandidateId int
+	// LastLogIndex int
+	// LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	// These two are for leader elections
+	Term     int
+	LeaderID int
+
+	// We need to add those below in the future
+
+	// PrevLogIndex int
+	// PrevLogTerm  int
+
+	// Entries[]
+	// LeaderCommit
+}
+
+type AppendEntriesReply struct {
+	Term int
+
+	// Success bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term <= rf.currentTerm {
+		// Do not vote
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	} else {
+		// Vote
+		reply.VoteGranted = true
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
+		return
+	}
+
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Handler for AppendEntries RPC
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	currentTerm, isLeader := rf.GetState()
+	if args.Term < currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	} else if args.Term > currentTerm {
+		// Raft needs to realize that there is a new leader
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
+		if isLeader {
+			rf.leaderToFollowerCh <- struct{}{}
+		}
+	} else {
+		// Still the same leader
+		reply.Term = args.Term
+	}
+	// If the leader still exists, whoever it it, we should send the heartbeat to
+	// the background goroutine
+	select {
+	case rf.heartbeatCh <- struct{}{}:
+		// Make sure there is no block
+		{
+			// Do nothing
+		}
+	default:
+		{
+			// Do nothing
+		}
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,6 +234,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -169,7 +257,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-
 
 	return index, term, isLeader
 }
@@ -195,13 +282,29 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
+		rf.mu.Lock()
+		_, isLeader := rf.GetState()
+		if isLeader {
+			rf.tickerCh <- struct{}{}
+			goto sleep
+		}
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
-
+		// If there is no heartbeat from the current leader
+		// We should kick off a new election
+		select {
+		case <-rf.heartbeatCh:
+			goto sleep
+		default:
+			// There is no heartbeat message, need to kick off a new election
+			rf.toCandidateCh <- struct{}{}
+			goto sleep
+		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
+	sleep:
+		rf.mu.Unlock()
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -231,6 +334,66 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-
 	return rf
+}
+
+func FollowerState(rf *Raft) {
+	for {
+		select {
+		case <-rf.toCandidateCh:
+			{
+				// Now need to become a candidate
+				go CandidateState(rf)
+				return
+			}
+		default:
+			// Do nothing
+			time.Sleep(time.Microsecond)
+		}
+	}
+}
+
+func CandidateState(rf *Raft) {
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	rf.mu.Unlock()
+	votes := 1
+	args := RequestVoteArgs{rf.currentTerm, rf.me}
+	for range rf.toCandidateCh {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			reply := RequestVoteReply{}
+			rf.sendRequestVote(i, &args, &reply)
+			if reply.VoteGranted {
+				votes += 1
+				if votes >= len(rf.peers)/2 {
+					go LeaderState(rf)
+					return
+				}
+			}
+		}
+	}
+}
+
+func LeaderState(rf *Raft) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	args := AppendEntriesArgs{rf.currentTerm, rf.me}
+	rf.isleader = true
+	for range rf.tickerCh {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(i, &args, &reply)
+			if ok && reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				go FollowerState(rf)
+				return
+			}
+		}
+	}
 }
