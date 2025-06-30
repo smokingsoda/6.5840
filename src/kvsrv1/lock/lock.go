@@ -28,6 +28,10 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 	// You may add code here
 	lk.ck.Put(lk.Name, "", 0)
 	lk.ClientID = kvtest.RandValue(8)
+	_, _, err := lk.ck.Get(lk.Name)
+	if err != rpc.OK {
+		panic("failed to add distributed lock")
+	}
 	return lk
 }
 
@@ -43,7 +47,17 @@ func (lk *Lock) Acquire() {
 				if err == rpc.OK {
 					return
 				}
+				if err == rpc.ErrMaybe {
+					value, _, _ := lk.ck.Get(lk.Name)
+					if value == lk.ClientID {
+						return
+					}
+					continue
+				}
 			}
+		}
+		if err == rpc.ErrNoKey {
+			panic("failed to acquire the lock: not exist")
 		}
 		<-ticker.C
 	}
@@ -54,8 +68,22 @@ func (lk *Lock) Release() {
 	// Your code here
 	value, version, _ := lk.ck.Get(lk.Name)
 	if lk.ClientID != value {
-		panic("failed to release the lock due to not requiring it before")
+		panic("failed to release the lock: not requiring it before")
 	}
-	lk.ck.Put(lk.Name, "", version)
-
+	for {
+		err := lk.ck.Put(lk.Name, "", version)
+		if err == rpc.ErrVersion {
+			// successfully released
+			return
+		}
+		if err == rpc.ErrMaybe {
+			// need to check again
+			continue
+		}
+		if err == rpc.OK {
+			// successfully released at the very first time
+			return
+		}
+		panic("something wrong")
+	}
 }

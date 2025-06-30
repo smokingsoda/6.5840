@@ -57,8 +57,6 @@ func oneClient(t *testing.T, me int, ck kvtest.IKVClerk, done chan struct{}) kvt
 
 			lk.Release()
 
-			// log.Printf("%d: released", me)
-
 		}
 	}
 	return kvtest.ClntRes{}
