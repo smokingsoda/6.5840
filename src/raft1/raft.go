@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -35,25 +36,17 @@ type Raft struct {
 	votedFor    int
 
 	// Inner chans for state switch
-	appendEntriesCh chan AppendEntriesMessage
-	requestVoteCh   chan RequestVoteMessage
-	electionCh      chan struct{}
-	heartbeatCh     chan struct{}
-}
-
-type AppendEntriesMessage struct {
-	Term int
-}
-
-type RequestVoteMessage struct {
-	Term        int
-	CandidateId int
+	toFollower        chan struct{}
+	electionCh        chan struct{}
+	heartbeatCh       chan struct{}
+	tickerChForLeader chan struct{}
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	// Your code here (3A).
@@ -158,10 +151,11 @@ type AppendEntriesReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (3A, 3B).
 	// Debug(dVote, "S%d <- S%d RequestVote: candidate term=%d, my term=%d", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-
-	currentTerm, _ := rf.GetState()
+	currentTerm := rf.currentTerm
 	if args.Term < currentTerm {
 		// Debug(dVote, "S%d reject vote from S%d: candidate term %d < my term %d", rf.me, args.CandidateId, args.Term, currentTerm)
 		reply.Term = rf.currentTerm
@@ -173,7 +167,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			rf.requestVoteCh <- RequestVoteMessage{args.Term, args.CandidateId}
+			if rf.isleader {
+				panic("leader received a same term R_RPC")
+			}
+			// rf.toFollower <- struct{}{}
 			return
 		} else {
 			// Debug(dVote, "S%d reject vote from S%d: already voted in term %d", rf.me, args.CandidateId, args.Term)
@@ -183,10 +180,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	} else if args.Term > currentTerm {
 		// Debug(dVote, "S%d grant vote to S%d: updating term from %d to %d", rf.me, args.CandidateId, currentTerm, args.Term)
-		reply.Term = rf.currentTerm
+		reply.Term = args.Term
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.requestVoteCh <- RequestVoteMessage{args.Term, args.CandidateId}
+		rf.isleader = false
+		rf.toFollower <- struct{}{}
 		return
 	}
 }
@@ -194,7 +192,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Handler for AppendEntries RPC
 	// Debug(dLog, "S%d <- S%d AppendEntries: leader term=%d, my term=%d", rf.me, args.LeaderID, args.Term, rf.currentTerm)
-	currentTerm, _ := rf.GetState()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	currentTerm := rf.currentTerm
 	if args.Term < currentTerm {
 		// Debug(dLog, "S%d reject AppendEntries from S%d: leader term %d < my term %d", rf.me, args.LeaderID, args.Term, currentTerm)
 		reply.Term = rf.currentTerm
@@ -205,7 +205,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Debug(dLog, "S%d accept AppendEntries from S%d (heartbeat) in term %d", rf.me, args.LeaderID, args.Term)
 		reply.Success = true
 		reply.Term = args.Term
-		rf.appendEntriesCh <- AppendEntriesMessage{args.Term}
+		rf.votedFor = -1
+		rf.isleader = false
+		rf.toFollower <- struct{}{}
 		select {
 		case rf.heartbeatCh <- struct{}{}:
 		default:
@@ -316,10 +318,14 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-		_, isLeader := rf.GetState()
+
+		rf.mu.Lock()
+		isLeader := rf.isleader
+		rf.mu.Unlock()
+
 		if isLeader {
 			// Debug(dTimer, "S%d ticker: sending heartbeats as leader", rf.me)
-			go LeaderSendAppendEntries(rf)
+			rf.tickerChForLeader <- struct{}{}
 		} else {
 			select {
 			case <-rf.heartbeatCh:
@@ -354,10 +360,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.isleader = false
 	rf.dead = 0
 
-	rf.appendEntriesCh = make(chan AppendEntriesMessage)
-	rf.requestVoteCh = make(chan RequestVoteMessage)
+	rf.toFollower = make(chan struct{})
 	rf.electionCh = make(chan struct{})
-	rf.heartbeatCh = make(chan struct{})
+	rf.heartbeatCh = make(chan struct{}, 1)
+	rf.tickerChForLeader = make(chan struct{})
 
 	Debug(dInfo, "S%d initialized with %d peers", me, len(peers))
 	// start as a follower
@@ -374,20 +380,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func FollowerState(rf *Raft) {
 	Debug(dInfo, "S%d entering FOLLOWER state in term %d", rf.me, rf.currentTerm)
+	rf.mu.Lock()
 	rf.isleader = false
+	rf.mu.Unlock()
 	for {
 		select {
-		case aEMessage := <-rf.appendEntriesCh:
-			if aEMessage.Term > rf.currentTerm {
-				// Debug(dTerm, "S%d follower: updating term from %d to %d", rf.me, rf.currentTerm, aEMessage.Term)
-				rf.currentTerm = aEMessage.Term
-			}
-		case rVMessage := <-rf.requestVoteCh:
-			// Debug(dVote, "S%d follower: voting for S%d in term %d", rf.me, rVMessage.CandidateId, rVMessage.Term)
-			if rVMessage.Term > rf.currentTerm {
-				// Debug(dTerm, "S%d follower: updating term from %d to %d", rf.me, rf.currentTerm, rVMessage.Term)
-				rf.currentTerm = rVMessage.Term
-			}
+		case <-rf.toFollower:
+			continue
 		case <-rf.electionCh:
 			Debug(dInfo, "S%d follower: timeout, becoming candidate", rf.me)
 			go CandidateState(rf)
@@ -397,40 +396,37 @@ func FollowerState(rf *Raft) {
 }
 
 func CandidateState(rf *Raft) {
+	rf.mu.Lock()
 	rf.currentTerm += 1
-	rf.isleader = false
+	currentTerm := rf.currentTerm
+	rf.votedFor = rf.me
+	rf.mu.Unlock()
 	Debug(dInfo, "S%d entering CANDIDATE state in term %d", rf.me, rf.currentTerm)
-
-	becomeLeaderCh := make(chan struct{})
-	becomeFollowerCh := make(chan struct{})
-	go CandidateSendRequestVote(rf, becomeLeaderCh, becomeFollowerCh)
+	toMain_BecomeLeader := make(chan struct{})
+	toMain_BecomeFollower := make(chan int)
+	toSub_StopSending := make(chan struct{})
+	go CandidateSendRequestVote(rf, toMain_BecomeLeader, toMain_BecomeFollower, toSub_StopSending, currentTerm, rf.me)
 	for {
 		select {
-		case <-becomeLeaderCh:
+		case <-toMain_BecomeLeader:
 			Debug(dLeader, "S%d candidate: won election, becoming leader in term %d", rf.me, rf.currentTerm)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			rf.isleader = true
 			go LeaderState(rf)
 			return
-		case aEMessage := <-rf.appendEntriesCh:
-			if aEMessage.Term > rf.currentTerm {
-				// Give up candidate state, turn into follower state
-				Debug(dInfo, "S%d candidate: higher term leader found, becoming follower", rf.me)
-				// Debug(dTerm, "S%d candidate: updating term from %d to %d", rf.me, rf.currentTerm, aEMessage.Term)
-				rf.currentTerm = aEMessage.Term
-				becomeFollowerCh <- struct{}{}
-				go FollowerState(rf)
-				return
-			}
+		case <-rf.toFollower:
+			Debug(dInfo, "S%d candidate: becoming follower", rf.me)
+			go FollowerState(rf)
+			return
 			// else we do nothing, because we have done that in RPC handler
-		case rVMessage := <-rf.requestVoteCh:
-			// Debug(dVote, "S%d candidate: voting for S%d in term %d", rf.me, rVMessage.CandidateId, rVMessage.Term)
-			if rVMessage.Term > rf.currentTerm {
-				// Debug(dTerm, "S%d candidate: updating term from %d to %d", rf.me, rf.currentTerm, rVMessage.Term)
-				rf.currentTerm = rVMessage.Term
-				becomeFollowerCh <- struct{}{}
-				Debug(dInfo, "S%d candidate: higher term leader found, becoming follower", rf.me)
-				go FollowerState(rf)
-				return
-			}
+		case newTerm := <-toMain_BecomeFollower:
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			rf.currentTerm = newTerm
+			Debug(dInfo, "S%d candidate: higher term leader found, becoming follower", rf.me)
+			go FollowerState(rf)
+			return
 		case <-rf.electionCh:
 			Debug(dInfo, "S%d candidate: restarting election", rf.me)
 			go CandidateState(rf)
@@ -439,31 +435,50 @@ func CandidateState(rf *Raft) {
 	}
 }
 
-func CandidateSendRequestVote(rf *Raft, becomeLeaderCh chan struct{}, becomeFollower chan struct{}) {
+func CandidateSendRequestVote(rf *Raft, toMain_BecomeLeader chan struct{}, toMain_BecomeFollower chan int, toSub_StopSending chan struct{}, currentTerm int, index int) {
 	count := 1
-	args := RequestVoteArgs{rf.currentTerm, rf.me}
-	rf.votedFor = rf.me
-	// Debug(dVote, "S%d candidate: voting for myself in term %d", rf.me, rf.currentTerm)
-	// Debug(dVote, "S%d candidate: requesting votes in term %d", rf.me, rf.currentTerm)
+	args := RequestVoteArgs{currentTerm, index}
+	voteCh := make(chan bool, len(rf.peers))
+	termCh := make(chan int, len(rf.peers))
+
 	for i := 0; i < len(rf.peers); i++ {
-		select {
-		case <-becomeFollower:
-			return
-		default:
-			if i == rf.me {
-				continue
-			}
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
 			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(i, &args, &reply)
-			if ok && reply.VoteGranted {
-				count += 1
-				// Debug(dVote, "S%d candidate: received vote from S%d, total votes=%d", rf.me, i, count)
+			ok := rf.sendRequestVote(server, &args, &reply)
+			if ok {
+				if reply.VoteGranted && reply.Term == currentTerm {
+					voteCh <- true
+				} else if reply.Term > currentTerm {
+					termCh <- reply.Term
+				} else {
+					voteCh <- false
+				}
+			} else {
+				voteCh <- false
+			}
+		}(i)
+	}
+
+	for i := 0; i < len(rf.peers)-1; i++ {
+		select {
+		case <-toSub_StopSending:
+			return
+		case vote := <-voteCh:
+			if vote {
+				count++
+				// Debug(dVote, "S%d candidate: received vote, total votes=%d", rf.me, count)
 			}
 			if count > len(rf.peers)/2 {
 				// Debug(dLeader, "S%d candidate: won election with %d votes", rf.me, count)
-				becomeLeaderCh <- struct{}{}
+				toMain_BecomeLeader <- struct{}{}
 				return
 			}
+		case newTerm := <-termCh:
+			toMain_BecomeFollower <- newTerm
+			return
 		}
 	}
 	// Debug(dVote, "S%d candidate: election failed, only got %d votes", rf.me, count)
@@ -471,44 +486,59 @@ func CandidateSendRequestVote(rf *Raft, becomeLeaderCh chan struct{}, becomeFoll
 
 func LeaderState(rf *Raft) {
 	Debug(dInfo, "S%d entering LEADER state in term %d", rf.me, rf.currentTerm)
+	rf.mu.Lock()
 	rf.isleader = true
+	rf.mu.Unlock()
+	toMain_BecomeFollower := make(chan int)
+	toSub_StopSending := make(chan struct{})
+	go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending)
 	for {
 		select {
-		case aEMessage := <-rf.appendEntriesCh:
-			if aEMessage.Term == rf.currentTerm {
-				panic("leader received a illegal AppendEntries RPC")
-			}
-			// This leader is no longer legal
-			// need to turn to a follower
-			// Debug(dLeader, "S%d leader: received higher term AppendEntries, stepping down", rf.me)
-			// Debug(dTerm, "S%d leader: updating term from %d to %d", rf.me, rf.currentTerm, aEMessage.Term)
-			rf.currentTerm = aEMessage.Term
+		case <-rf.toFollower:
 			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
+			toSub_StopSending <- struct{}{}
 			go FollowerState(rf)
 			return
-		case rVMessage := <-rf.requestVoteCh:
-			// Debug(dLeader, "S%d leader: received vote request, stepping down", rf.me)
-			if rVMessage.Term > rf.currentTerm {
-				// Debug(dTerm, "S%d leader: updating term from %d to %d", rf.me, rf.currentTerm, rVMessage.Term)
-				rf.currentTerm = rVMessage.Term
-			}
-			// This leader is no longer legal
-			// need to turn to a follower
-			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
+		case <-rf.tickerChForLeader:
+			toSub_StopSending <- struct{}{}
+			go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending)
+		case newTerm := <-toMain_BecomeFollower:
+			rf.mu.Lock()
+			rf.currentTerm = newTerm
+			rf.mu.Unlock()
 			go FollowerState(rf)
+			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
 			return
 		}
 	}
 }
 
-func LeaderSendAppendEntries(rf *Raft) {
+func LeaderSendAppendEntries(rf *Raft, toMain_BecomeFollower chan int, toSub_StopSending chan struct{}) {
+	rf.mu.Lock()
 	args := AppendEntriesArgs{rf.currentTerm, rf.me}
+	rf.mu.Unlock()
 	// Debug(dLeader, "S%d leader: sending heartbeats in term %d", rf.me, rf.currentTerm)
+
+	termCh := make(chan int, len(rf.peers))
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		reply := AppendEntriesReply{}
-		rf.sendAppendEntries(i, &args, &reply)
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			if ok && !reply.Success {
+				termCh <- reply.Term
+			}
+		}(i)
+	}
+
+	select {
+	case <-toSub_StopSending:
+		return
+	case newTerm := <-termCh:
+		toMain_BecomeFollower <- newTerm
+		return
 	}
 }
