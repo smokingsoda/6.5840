@@ -35,12 +35,19 @@ type Raft struct {
 	votedFor    int
 
 	// Inner chans for state switch
-	toCandidateCh       chan struct{}
-	candidateToLeaderCh chan struct{}
-	leaderToFollowerCh  chan struct{}
+	appendEntriesCh chan AppendEntriesMessage
+	requestVoteCh   chan RequestVoteMessage
+	electionCh      chan struct{}
+	heartbeatCh     chan struct{}
+}
 
-	heartbeatCh chan struct{}
-	tickerCh    chan struct{}
+type AppendEntriesMessage struct {
+	Term int
+}
+
+type RequestVoteMessage struct {
+	Term        int
+	CandidateId int
 }
 
 // return currentTerm and whether this server
@@ -71,11 +78,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	// Debug(dPersist, "S%d persisting state: term=%d, votedFor=%d", rf.me, rf.currentTerm, rf.votedFor)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		// Debug(dPersist, "S%d no persistent state found, bootstrapping", rf.me)
 		return
 	}
 	// Your code here (3C).
@@ -91,6 +100,7 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	// Debug(dPersist, "S%d reading persistent state", rf.me)
 }
 
 // how many bytes in Raft's persisted log?
@@ -106,7 +116,7 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
+	// Debug(dSnap, "S%d snapshot requested for index %d", rf.me, index)
 }
 
 // example RequestVote RPC arguments structure.
@@ -142,64 +152,66 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term int
-
-	// Success bool
+	Term    int
+	Success bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term <= rf.currentTerm {
-		// Do not vote
+	// Debug(dVote, "S%d <- S%d RequestVote: candidate term=%d, my term=%d", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+
+	currentTerm, _ := rf.GetState()
+	if args.Term < currentTerm {
+		// Debug(dVote, "S%d reject vote from S%d: candidate term %d < my term %d", rf.me, args.CandidateId, args.Term, currentTerm)
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
 		return
-	} else {
-		// Vote
-		reply.VoteGranted = true
-		rf.currentTerm = args.Term
+	} else if args.Term == currentTerm {
+		if rf.votedFor == -1 {
+			// Debug(dVote, "S%d grant vote to S%d in term %d", rf.me, args.CandidateId, args.Term)
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			rf.requestVoteCh <- RequestVoteMessage{args.Term, args.CandidateId}
+			return
+		} else {
+			// Debug(dVote, "S%d reject vote from S%d: already voted in term %d", rf.me, args.CandidateId, args.Term)
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+			return
+		}
+	} else if args.Term > currentTerm {
+		// Debug(dVote, "S%d grant vote to S%d: updating term from %d to %d", rf.me, args.CandidateId, currentTerm, args.Term)
 		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.requestVoteCh <- RequestVoteMessage{args.Term, args.CandidateId}
 		return
 	}
-
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Handler for AppendEntries RPC
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	currentTerm, isLeader := rf.GetState()
+	// Debug(dLog, "S%d <- S%d AppendEntries: leader term=%d, my term=%d", rf.me, args.LeaderID, args.Term, rf.currentTerm)
+	currentTerm, _ := rf.GetState()
 	if args.Term < currentTerm {
+		// Debug(dLog, "S%d reject AppendEntries from S%d: leader term %d < my term %d", rf.me, args.LeaderID, args.Term, currentTerm)
 		reply.Term = rf.currentTerm
+		reply.Success = false
 		return
-	} else if args.Term > currentTerm {
-		// Raft needs to realize that there is a new leader
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		if isLeader {
-			rf.leaderToFollowerCh <- struct{}{}
-		}
 	} else {
-		// Still the same leader
+		// A legal leader calls an AppendEntries RPC
+		// Debug(dLog, "S%d accept AppendEntries from S%d (heartbeat) in term %d", rf.me, args.LeaderID, args.Term)
+		reply.Success = true
 		reply.Term = args.Term
-	}
-	// If the leader still exists, whoever it it, we should send the heartbeat to
-	// the background goroutine
-	select {
-	case rf.heartbeatCh <- struct{}{}:
-		// Make sure there is no block
-		{
-			// Do nothing
+		rf.appendEntriesCh <- AppendEntriesMessage{args.Term}
+		select {
+		case rf.heartbeatCh <- struct{}{}:
+		default:
 		}
-	default:
-		{
-			// Do nothing
-		}
+		return
 	}
-
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -230,12 +242,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	// Debug(dVote, "S%d -> S%d sending RequestVote in term %d", rf.me, server, args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if ok {
+		// Debug(dVote, "S%d <- S%d RequestVote reply: granted=%v, term=%d", rf.me, server, reply.VoteGranted, reply.Term)
+	} else {
+		// Debug(dDrop, "S%d -> S%d RequestVote RPC failed", rf.me, server)
+	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// Debug(dLog, "S%d -> S%d sending AppendEntries (heartbeat) in term %d", rf.me, server, args.Term)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok {
+		// Debug(dLog, "S%d <- S%d AppendEntries reply: success=%v, term=%d", rf.me, server, reply.Success, reply.Term)
+	} else {
+		// Debug(dDrop, "S%d -> S%d AppendEntries RPC failed", rf.me, server)
+	}
 	return ok
 }
 
@@ -257,6 +281,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	term, isLeader = rf.GetState()
+
+	if isLeader {
+		// Debug(dClient, "S%d Start() called as leader in term %d", rf.me, term)
+	} else {
+		// Debug(dClient, "S%d Start() called but not leader in term %d", rf.me, term)
+	}
 
 	return index, term, isLeader
 }
@@ -272,6 +303,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	Debug(dInfo, "S%d killed", rf.me)
 	// Your code here, if desired.
 }
 
@@ -282,31 +314,21 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		rf.mu.Lock()
-		_, isLeader := rf.GetState()
-		if isLeader {
-			rf.tickerCh <- struct{}{}
-			goto sleep
-		}
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-		// If there is no heartbeat from the current leader
-		// We should kick off a new election
-		select {
-		case <-rf.heartbeatCh:
-			goto sleep
-		default:
-			// There is no heartbeat message, need to kick off a new election
-			rf.toCandidateCh <- struct{}{}
-			goto sleep
-		}
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-	sleep:
-		rf.mu.Unlock()
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+		_, isLeader := rf.GetState()
+		if isLeader {
+			// Debug(dTimer, "S%d ticker: sending heartbeats as leader", rf.me)
+			go LeaderSendAppendEntries(rf)
+		} else {
+			select {
+			case <-rf.heartbeatCh:
+				// Debug(dTimer, "S%d ticker: received heartbeat", rf.me)
+			default:
+				// Debug(dTimer, "S%d ticker: triggering election", rf.me)
+				rf.electionCh <- struct{}{}
+			}
+		}
 	}
 }
 
@@ -327,6 +349,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.isleader = false
+	rf.dead = 0
+
+	rf.appendEntriesCh = make(chan AppendEntriesMessage)
+	rf.requestVoteCh = make(chan RequestVoteMessage)
+	rf.electionCh = make(chan struct{})
+	rf.heartbeatCh = make(chan struct{})
+
+	Debug(dInfo, "S%d initialized with %d peers", me, len(peers))
+	// start as a follower
+	go FollowerState(rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -338,62 +373,142 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func FollowerState(rf *Raft) {
+	Debug(dInfo, "S%d entering FOLLOWER state in term %d", rf.me, rf.currentTerm)
+	rf.isleader = false
 	for {
 		select {
-		case <-rf.toCandidateCh:
-			{
-				// Now need to become a candidate
-				go CandidateState(rf)
-				return
+		case aEMessage := <-rf.appendEntriesCh:
+			if aEMessage.Term > rf.currentTerm {
+				// Debug(dTerm, "S%d follower: updating term from %d to %d", rf.me, rf.currentTerm, aEMessage.Term)
+				rf.currentTerm = aEMessage.Term
 			}
-		default:
-			// Do nothing
-			time.Sleep(time.Microsecond)
+		case rVMessage := <-rf.requestVoteCh:
+			// Debug(dVote, "S%d follower: voting for S%d in term %d", rf.me, rVMessage.CandidateId, rVMessage.Term)
+			if rVMessage.Term > rf.currentTerm {
+				// Debug(dTerm, "S%d follower: updating term from %d to %d", rf.me, rf.currentTerm, rVMessage.Term)
+				rf.currentTerm = rVMessage.Term
+			}
+		case <-rf.electionCh:
+			Debug(dInfo, "S%d follower: timeout, becoming candidate", rf.me)
+			go CandidateState(rf)
+			return
 		}
 	}
 }
 
 func CandidateState(rf *Raft) {
-	rf.mu.Lock()
 	rf.currentTerm += 1
-	rf.mu.Unlock()
-	votes := 1
-	args := RequestVoteArgs{rf.currentTerm, rf.me}
-	for range rf.toCandidateCh {
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
+	rf.isleader = false
+	Debug(dInfo, "S%d entering CANDIDATE state in term %d", rf.me, rf.currentTerm)
+
+	becomeLeaderCh := make(chan struct{})
+	becomeFollowerCh := make(chan struct{})
+	go CandidateSendRequestVote(rf, becomeLeaderCh, becomeFollowerCh)
+	for {
+		select {
+		case <-becomeLeaderCh:
+			Debug(dLeader, "S%d candidate: won election, becoming leader in term %d", rf.me, rf.currentTerm)
+			go LeaderState(rf)
+			return
+		case aEMessage := <-rf.appendEntriesCh:
+			if aEMessage.Term > rf.currentTerm {
+				// Give up candidate state, turn into follower state
+				Debug(dInfo, "S%d candidate: higher term leader found, becoming follower", rf.me)
+				// Debug(dTerm, "S%d candidate: updating term from %d to %d", rf.me, rf.currentTerm, aEMessage.Term)
+				rf.currentTerm = aEMessage.Term
+				becomeFollowerCh <- struct{}{}
+				go FollowerState(rf)
+				return
 			}
-			reply := RequestVoteReply{}
-			rf.sendRequestVote(i, &args, &reply)
-			if reply.VoteGranted {
-				votes += 1
-				if votes >= len(rf.peers)/2 {
-					go LeaderState(rf)
-					return
-				}
+			// else we do nothing, because we have done that in RPC handler
+		case rVMessage := <-rf.requestVoteCh:
+			// Debug(dVote, "S%d candidate: voting for S%d in term %d", rf.me, rVMessage.CandidateId, rVMessage.Term)
+			if rVMessage.Term > rf.currentTerm {
+				// Debug(dTerm, "S%d candidate: updating term from %d to %d", rf.me, rf.currentTerm, rVMessage.Term)
+				rf.currentTerm = rVMessage.Term
+				becomeFollowerCh <- struct{}{}
+				Debug(dInfo, "S%d candidate: higher term leader found, becoming follower", rf.me)
+				go FollowerState(rf)
+				return
 			}
+		case <-rf.electionCh:
+			Debug(dInfo, "S%d candidate: restarting election", rf.me)
+			go CandidateState(rf)
+			return
 		}
 	}
 }
 
-func LeaderState(rf *Raft) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	args := AppendEntriesArgs{rf.currentTerm, rf.me}
-	rf.isleader = true
-	for range rf.tickerCh {
-		for i := 0; i < len(rf.peers); i++ {
+func CandidateSendRequestVote(rf *Raft, becomeLeaderCh chan struct{}, becomeFollower chan struct{}) {
+	count := 1
+	args := RequestVoteArgs{rf.currentTerm, rf.me}
+	rf.votedFor = rf.me
+	// Debug(dVote, "S%d candidate: voting for myself in term %d", rf.me, rf.currentTerm)
+	// Debug(dVote, "S%d candidate: requesting votes in term %d", rf.me, rf.currentTerm)
+	for i := 0; i < len(rf.peers); i++ {
+		select {
+		case <-becomeFollower:
+			return
+		default:
 			if i == rf.me {
 				continue
 			}
-			reply := AppendEntriesReply{}
-			ok := rf.sendAppendEntries(i, &args, &reply)
-			if ok && reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				go FollowerState(rf)
+			reply := RequestVoteReply{}
+			ok := rf.sendRequestVote(i, &args, &reply)
+			if ok && reply.VoteGranted {
+				count += 1
+				// Debug(dVote, "S%d candidate: received vote from S%d, total votes=%d", rf.me, i, count)
+			}
+			if count > len(rf.peers)/2 {
+				// Debug(dLeader, "S%d candidate: won election with %d votes", rf.me, count)
+				becomeLeaderCh <- struct{}{}
 				return
 			}
 		}
+	}
+	// Debug(dVote, "S%d candidate: election failed, only got %d votes", rf.me, count)
+}
+
+func LeaderState(rf *Raft) {
+	Debug(dInfo, "S%d entering LEADER state in term %d", rf.me, rf.currentTerm)
+	rf.isleader = true
+	for {
+		select {
+		case aEMessage := <-rf.appendEntriesCh:
+			if aEMessage.Term == rf.currentTerm {
+				panic("leader received a illegal AppendEntries RPC")
+			}
+			// This leader is no longer legal
+			// need to turn to a follower
+			// Debug(dLeader, "S%d leader: received higher term AppendEntries, stepping down", rf.me)
+			// Debug(dTerm, "S%d leader: updating term from %d to %d", rf.me, rf.currentTerm, aEMessage.Term)
+			rf.currentTerm = aEMessage.Term
+			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
+			go FollowerState(rf)
+			return
+		case rVMessage := <-rf.requestVoteCh:
+			// Debug(dLeader, "S%d leader: received vote request, stepping down", rf.me)
+			if rVMessage.Term > rf.currentTerm {
+				// Debug(dTerm, "S%d leader: updating term from %d to %d", rf.me, rf.currentTerm, rVMessage.Term)
+				rf.currentTerm = rVMessage.Term
+			}
+			// This leader is no longer legal
+			// need to turn to a follower
+			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
+			go FollowerState(rf)
+			return
+		}
+	}
+}
+
+func LeaderSendAppendEntries(rf *Raft) {
+	args := AppendEntriesArgs{rf.currentTerm, rf.me}
+	// Debug(dLeader, "S%d leader: sending heartbeats in term %d", rf.me, rf.currentTerm)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		reply := AppendEntriesReply{}
+		rf.sendAppendEntries(i, &args, &reply)
 	}
 }
