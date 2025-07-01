@@ -440,10 +440,11 @@ func CandidateSendRequestVote(rf *Raft, toMain_BecomeLeader chan struct{}, toMai
 func LeaderState(rf *Raft) {
 	rf.mu.Lock()
 	rf.isleader = true
+	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
 	toMain_BecomeFollower := make(chan int)
 	toSub_StopSending := make(chan struct{})
-	go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending)
+	go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending, currentTerm, rf.me)
 	for {
 		select {
 		case <-rf.toFollower:
@@ -452,7 +453,7 @@ func LeaderState(rf *Raft) {
 			return
 		case <-rf.tickerCh:
 			toSub_StopSending <- struct{}{}
-			go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending)
+			go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending, currentTerm, rf.me)
 		case newTerm := <-toMain_BecomeFollower:
 			rf.mu.Lock()
 			rf.currentTerm = newTerm
@@ -463,13 +464,11 @@ func LeaderState(rf *Raft) {
 	}
 }
 
-func LeaderSendAppendEntries(rf *Raft, toMain_BecomeFollower chan int, toSub_StopSending chan struct{}) {
-	rf.mu.Lock()
-	args := AppendEntriesArgs{rf.currentTerm, rf.me}
-	rf.mu.Unlock()
-
+func LeaderSendAppendEntries(rf *Raft, toMain_BecomeFollower chan int, toSub_StopSending chan struct{}, currentTerm int, index int) {
+	// We should not hold the lock here
+	// In case the term has been modified by other goroutine or RPCs
+	args := AppendEntriesArgs{currentTerm, index}
 	termCh := make(chan int, len(rf.peers))
-
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
