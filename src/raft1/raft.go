@@ -36,10 +36,9 @@ type Raft struct {
 	votedFor    int
 
 	// Inner chans for state switch
-	toFollower        chan struct{}
-	electionCh        chan struct{}
-	heartbeatCh       chan struct{}
-	tickerChForLeader chan struct{}
+	toFollower  chan struct{}
+	heartbeatCh chan struct{}
+	tickerCh    chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -71,13 +70,11 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
-	// Debug(dPersist, "S%d persisting state: term=%d, votedFor=%d", rf.me, rf.currentTerm, rf.votedFor)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		// Debug(dPersist, "S%d no persistent state found, bootstrapping", rf.me)
 		return
 	}
 	// Your code here (3C).
@@ -93,7 +90,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	// Debug(dPersist, "S%d reading persistent state", rf.me)
 }
 
 // how many bytes in Raft's persisted log?
@@ -109,7 +105,6 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-	// Debug(dSnap, "S%d snapshot requested for index %d", rf.me, index)
 }
 
 // example RequestVote RPC arguments structure.
@@ -152,61 +147,62 @@ type AppendEntriesReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	// Your code here (3A, 3B).
-	// Debug(dVote, "S%d <- S%d RequestVote: candidate term=%d, my term=%d", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 	currentTerm := rf.currentTerm
 	if args.Term < currentTerm {
-		// Debug(dVote, "S%d reject vote from S%d: candidate term %d < my term %d", rf.me, args.CandidateId, args.Term, currentTerm)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		rf.mu.Unlock()
 		return
 	} else if args.Term == currentTerm {
 		if rf.votedFor == -1 {
-			// Debug(dVote, "S%d grant vote to S%d in term %d", rf.me, args.CandidateId, args.Term)
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			if rf.isleader {
 				panic("leader received a same term R_RPC")
 			}
-			// rf.toFollower <- struct{}{}
+			rf.mu.Unlock()
 			return
 		} else {
-			// Debug(dVote, "S%d reject vote from S%d: already voted in term %d", rf.me, args.CandidateId, args.Term)
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
+			rf.mu.Unlock()
 			return
 		}
 	} else if args.Term > currentTerm {
-		// Debug(dVote, "S%d grant vote to S%d: updating term from %d to %d", rf.me, args.CandidateId, currentTerm, args.Term)
 		reply.Term = args.Term
 		reply.VoteGranted = true
+		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 		rf.isleader = false
+		// Need to unlock in advance
+		// Becasue it holds both toFollower chan and the lock
+		rf.mu.Unlock()
 		rf.toFollower <- struct{}{}
 		return
 	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Handler for AppendEntries RPC
-	// Debug(dLog, "S%d <- S%d AppendEntries: leader term=%d, my term=%d", rf.me, args.LeaderID, args.Term, rf.currentTerm)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	if args.Term < currentTerm {
-		// Debug(dLog, "S%d reject AppendEntries from S%d: leader term %d < my term %d", rf.me, args.LeaderID, args.Term, currentTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.mu.Unlock()
 		return
 	} else {
-		// A legal leader calls an AppendEntries RPC
-		// Debug(dLog, "S%d accept AppendEntries from S%d (heartbeat) in term %d", rf.me, args.LeaderID, args.Term)
 		reply.Success = true
 		reply.Term = args.Term
-		rf.votedFor = -1
+		if args.Term > currentTerm {
+			rf.currentTerm = args.Term
+			rf.votedFor = -1
+		}
 		rf.isleader = false
+		// Need to unlock in advance
+		// Because it holds both toFollower chan and lock
+		rf.mu.Unlock()
 		rf.toFollower <- struct{}{}
 		select {
 		case rf.heartbeatCh <- struct{}{}:
@@ -244,24 +240,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	// Debug(dVote, "S%d -> S%d sending RequestVote in term %d", rf.me, server, args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		// Debug(dVote, "S%d <- S%d RequestVote reply: granted=%v, term=%d", rf.me, server, reply.VoteGranted, reply.Term)
-	} else {
-		// Debug(dDrop, "S%d -> S%d RequestVote RPC failed", rf.me, server)
-	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// Debug(dLog, "S%d -> S%d sending AppendEntries (heartbeat) in term %d", rf.me, server, args.Term)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		// Debug(dLog, "S%d <- S%d AppendEntries reply: success=%v, term=%d", rf.me, server, reply.Success, reply.Term)
-	} else {
-		// Debug(dDrop, "S%d -> S%d AppendEntries RPC failed", rf.me, server)
-	}
 	return ok
 }
 
@@ -285,12 +269,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	term, isLeader = rf.GetState()
 
-	if isLeader {
-		// Debug(dClient, "S%d Start() called as leader in term %d", rf.me, term)
-	} else {
-		// Debug(dClient, "S%d Start() called but not leader in term %d", rf.me, term)
-	}
-
 	return index, term, isLeader
 }
 
@@ -305,7 +283,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	Debug(dInfo, "S%d killed", rf.me)
 	// Your code here, if desired.
 }
 
@@ -319,21 +296,10 @@ func (rf *Raft) ticker() {
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
-		rf.mu.Lock()
-		isLeader := rf.isleader
-		rf.mu.Unlock()
-
-		if isLeader {
-			// Debug(dTimer, "S%d ticker: sending heartbeats as leader", rf.me)
-			rf.tickerChForLeader <- struct{}{}
-		} else {
-			select {
-			case <-rf.heartbeatCh:
-				// Debug(dTimer, "S%d ticker: received heartbeat", rf.me)
-			default:
-				// Debug(dTimer, "S%d ticker: triggering election", rf.me)
-				rf.electionCh <- struct{}{}
-			}
+		select {
+		case <-rf.heartbeatCh:
+		default:
+			rf.tickerCh <- struct{}{}
 		}
 	}
 }
@@ -361,11 +327,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.dead = 0
 
 	rf.toFollower = make(chan struct{})
-	rf.electionCh = make(chan struct{})
 	rf.heartbeatCh = make(chan struct{}, 1)
-	rf.tickerChForLeader = make(chan struct{})
+	rf.tickerCh = make(chan struct{})
 
-	Debug(dInfo, "S%d initialized with %d peers", me, len(peers))
 	// start as a follower
 	go FollowerState(rf)
 
@@ -379,7 +343,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func FollowerState(rf *Raft) {
-	Debug(dInfo, "S%d entering FOLLOWER state in term %d", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.isleader = false
 	rf.mu.Unlock()
@@ -387,8 +350,7 @@ func FollowerState(rf *Raft) {
 		select {
 		case <-rf.toFollower:
 			continue
-		case <-rf.electionCh:
-			Debug(dInfo, "S%d follower: timeout, becoming candidate", rf.me)
+		case <-rf.tickerCh:
 			go CandidateState(rf)
 			return
 		}
@@ -401,7 +363,6 @@ func CandidateState(rf *Raft) {
 	currentTerm := rf.currentTerm
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
-	Debug(dInfo, "S%d entering CANDIDATE state in term %d", rf.me, rf.currentTerm)
 	toMain_BecomeLeader := make(chan struct{})
 	toMain_BecomeFollower := make(chan int)
 	toSub_StopSending := make(chan struct{})
@@ -409,26 +370,21 @@ func CandidateState(rf *Raft) {
 	for {
 		select {
 		case <-toMain_BecomeLeader:
-			Debug(dLeader, "S%d candidate: won election, becoming leader in term %d", rf.me, rf.currentTerm)
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			rf.isleader = true
 			go LeaderState(rf)
 			return
 		case <-rf.toFollower:
-			Debug(dInfo, "S%d candidate: becoming follower", rf.me)
 			go FollowerState(rf)
 			return
-			// else we do nothing, because we have done that in RPC handler
 		case newTerm := <-toMain_BecomeFollower:
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			rf.currentTerm = newTerm
-			Debug(dInfo, "S%d candidate: higher term leader found, becoming follower", rf.me)
 			go FollowerState(rf)
 			return
-		case <-rf.electionCh:
-			Debug(dInfo, "S%d candidate: restarting election", rf.me)
+		case <-rf.tickerCh:
 			go CandidateState(rf)
 			return
 		}
@@ -469,10 +425,8 @@ func CandidateSendRequestVote(rf *Raft, toMain_BecomeLeader chan struct{}, toMai
 		case vote := <-voteCh:
 			if vote {
 				count++
-				// Debug(dVote, "S%d candidate: received vote, total votes=%d", rf.me, count)
 			}
 			if count > len(rf.peers)/2 {
-				// Debug(dLeader, "S%d candidate: won election with %d votes", rf.me, count)
 				toMain_BecomeLeader <- struct{}{}
 				return
 			}
@@ -481,11 +435,9 @@ func CandidateSendRequestVote(rf *Raft, toMain_BecomeLeader chan struct{}, toMai
 			return
 		}
 	}
-	// Debug(dVote, "S%d candidate: election failed, only got %d votes", rf.me, count)
 }
 
 func LeaderState(rf *Raft) {
-	Debug(dInfo, "S%d entering LEADER state in term %d", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.isleader = true
 	rf.mu.Unlock()
@@ -495,11 +447,10 @@ func LeaderState(rf *Raft) {
 	for {
 		select {
 		case <-rf.toFollower:
-			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
 			toSub_StopSending <- struct{}{}
 			go FollowerState(rf)
 			return
-		case <-rf.tickerChForLeader:
+		case <-rf.tickerCh:
 			toSub_StopSending <- struct{}{}
 			go LeaderSendAppendEntries(rf, toMain_BecomeFollower, toSub_StopSending)
 		case newTerm := <-toMain_BecomeFollower:
@@ -507,7 +458,6 @@ func LeaderState(rf *Raft) {
 			rf.currentTerm = newTerm
 			rf.mu.Unlock()
 			go FollowerState(rf)
-			Debug(dTerm, "S%d leader: becoming a follower", rf.me)
 			return
 		}
 	}
@@ -517,7 +467,6 @@ func LeaderSendAppendEntries(rf *Raft, toMain_BecomeFollower chan int, toSub_Sto
 	rf.mu.Lock()
 	args := AppendEntriesArgs{rf.currentTerm, rf.me}
 	rf.mu.Unlock()
-	// Debug(dLeader, "S%d leader: sending heartbeats in term %d", rf.me, rf.currentTerm)
 
 	termCh := make(chan int, len(rf.peers))
 
