@@ -38,7 +38,6 @@ type Raft struct {
 	// Inner chans for state switch
 	toFollower  chan struct{}
 	toLeader    chan struct{}
-	toCandidate chan struct{}
 	heartbeatCh chan struct{}
 	tickerCh    chan struct{}
 }
@@ -179,7 +178,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// Need to unlock in advance
 		// Becasue it holds both toFollower chan and the lock
 		rf.toFollower <- struct{}{}
-		go FollowerState(rf)
+		go FollowerState(rf, rf.currentTerm)
 		return
 	}
 }
@@ -207,7 +206,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		case rf.heartbeatCh <- struct{}{}:
 		default:
 		}
-		go FollowerState(rf)
+		go FollowerState(rf, rf.currentTerm)
 		return
 	}
 }
@@ -246,7 +245,7 @@ func (rf *Raft) SwitchToFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.isleader = false
 	rf.toFollower <- struct{}{}
-	go FollowerState(rf)
+	go FollowerState(rf, rf.currentTerm)
 	return
 }
 
@@ -256,7 +255,6 @@ func (rf *Raft) SwitchToCandidate() {
 	rf.currentTerm += 1
 	Debug(dVote, "S%d starts election in term %d", rf.me, rf.currentTerm)
 	rf.isleader = false
-	rf.toCandidate <- struct{}{}
 	go CandidateState(rf, rf.currentTerm)
 	return
 }
@@ -376,13 +374,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.dead = 0
 
 	rf.toFollower = make(chan struct{})
-	rf.toCandidate = make(chan struct{})
 	rf.toLeader = make(chan struct{})
 	rf.heartbeatCh = make(chan struct{}, 1)
 	rf.tickerCh = make(chan struct{})
 
 	// start as a follower
-	go FollowerState(rf)
+	go FollowerState(rf, rf.currentTerm)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -393,15 +390,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func FollowerState(rf *Raft) {
-	Debug(dInfo, "S%d enters follower state", rf.me)
+func FollowerState(rf *Raft, currentTerm int) {
+	Debug(dInfo, "S%d enters follower state for term", rf.me, currentTerm)
 	for {
 		select {
 		case <-rf.toFollower:
 			continue
 		case <-rf.tickerCh:
+			// Here, we can not achieve atomic state switch
 			go rf.SwitchToCandidate()
-		case <-rf.toCandidate:
 			return
 		}
 	}
@@ -419,11 +416,10 @@ func CandidateState(rf *Raft, currentTerm int) {
 		case <-rf.toFollower:
 			toSub_StopSending <- struct{}{}
 			return
-		case <-rf.toCandidate:
-			toSub_StopSending <- struct{}{}
-			return
 		case <-rf.tickerCh:
+			toSub_StopSending <- struct{}{}
 			go rf.SwitchToCandidate()
+			return
 		}
 	}
 }
