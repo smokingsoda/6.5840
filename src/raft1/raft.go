@@ -29,18 +29,28 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
-	isleader bool
+	state NodeState
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
 
-	// Inner chans for state switch
-	toFollower  chan struct{}
-	toLeader    chan struct{}
-	heartbeatCh chan struct{}
-	tickerCh    chan struct{}
+	// Event channels for state machine
+	heartbeatCh       chan struct{}
+	electionTimeoutCh chan struct{}
+
+	// Election tracking
+	votesReceived int
+	votesNeeded   int
 }
+
+type NodeState int
+
+const (
+	Follower NodeState = iota
+	Candidate
+	Leader
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -51,7 +61,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (3A).
 	term = rf.currentTerm
-	isleader = rf.isleader
+	isleader = (rf.state == Leader)
 	return term, isleader
 }
 
@@ -160,7 +170,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			if rf.isleader {
+			if rf.state == Leader {
 				// should discard
 			}
 			return
@@ -174,11 +184,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
-		rf.isleader = false
-		// Need to unlock in advance
-		// Becasue it holds both toFollower chan and the lock
-		rf.toFollower <- struct{}{}
-		go FollowerState(rf, rf.currentTerm)
+		rf.state = Follower
+		// Reset election timeout when receiving valid vote request
+		select {
+		case rf.heartbeatCh <- struct{}{}:
+		default:
+		}
 		return
 	}
 }
@@ -198,65 +209,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 		}
-		rf.isleader = false
-		// Need to unlock in advance
-		// Because it holds both toFollower chan and lock
-		rf.toFollower <- struct{}{}
+		rf.state = Follower
+		// Reset election timeout when receiving heartbeat
 		select {
 		case rf.heartbeatCh <- struct{}{}:
 		default:
 		}
-		go FollowerState(rf, rf.currentTerm)
 		return
 	}
 }
 
-func (rf *Raft) SwitchToLeader(newTerm int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	currentTerm := rf.currentTerm
-	isLeader := rf.isleader
-	if isLeader {
-		return
-	}
-	if newTerm != currentTerm {
-		panic("switch leader: wrong state")
-	}
-	Debug(dLeader, "S%d becomes leader in term %d", rf.me, newTerm)
+// State management functions - now simplified without goroutine spawning
+func (rf *Raft) becomeFollower(newTerm int) {
+	Debug(dInfo, "S%d enters follower state for term %d", rf.me, newTerm)
 	rf.currentTerm = newTerm
-	rf.isleader = true
+	rf.state = Follower
 	rf.votedFor = -1
-	rf.toLeader <- struct{}{}
-	go LeaderState(rf, rf.currentTerm)
-	return
+	rf.votesReceived = 0
 }
 
-func (rf *Raft) SwitchToFollower(newTerm int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	currentTerm := rf.currentTerm
-	if newTerm < currentTerm {
-		return
-	}
-	if newTerm > currentTerm {
-		rf.votedFor = -1
-	}
-	Debug(dTerm, "S%d switches to follower in term %d", rf.me, newTerm)
-	rf.currentTerm = newTerm
-	rf.isleader = false
-	rf.toFollower <- struct{}{}
-	go FollowerState(rf, rf.currentTerm)
-	return
-}
-
-func (rf *Raft) SwitchToCandidate() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.currentTerm += 1
+func (rf *Raft) becomeCandidate() {
+	rf.currentTerm++
+	rf.state = Candidate
+	rf.votedFor = rf.me
+	rf.votesReceived = 1 // Vote for self
+	rf.votesNeeded = len(rf.peers)/2 + 1
 	Debug(dVote, "S%d starts election in term %d", rf.me, rf.currentTerm)
-	rf.isleader = false
-	go CandidateState(rf, rf.currentTerm)
-	return
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.state = Leader
+	rf.votedFor = -1
+	rf.votesReceived = 0
+	Debug(dLeader, "S%d becomes leader in term %d", rf.me, rf.currentTerm)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -338,16 +323,142 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+// Main state machine goroutine
+func (rf *Raft) runStateMachine() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
 
-		select {
-		case <-rf.heartbeatCh:
-		default:
-			rf.tickerCh <- struct{}{}
+		switch state {
+		case Follower:
+			rf.runFollower()
+		case Candidate:
+			rf.runCandidate()
+		case Leader:
+			rf.runLeader()
 		}
+	}
+}
+
+func (rf *Raft) runFollower() {
+	// Random election timeout between 150-300ms
+	timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+
+	select {
+	case <-rf.heartbeatCh:
+		// Received heartbeat, stay as follower
+		return
+	case <-time.After(timeout):
+		// Election timeout, become candidate
+		rf.mu.Lock()
+		rf.becomeCandidate()
+		rf.mu.Unlock()
+		return
+	}
+}
+
+func (rf *Raft) runCandidate() {
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	// Start election
+	rf.startElection(currentTerm)
+
+	// Election timeout
+	timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+
+	select {
+	case <-rf.heartbeatCh:
+		// Received valid heartbeat from leader, become follower
+		rf.mu.Lock()
+		rf.becomeFollower(rf.currentTerm)
+		rf.mu.Unlock()
+		return
+	case <-time.After(timeout):
+		// Election timeout, start new election
+		rf.mu.Lock()
+		rf.becomeCandidate()
+		rf.mu.Unlock()
+		return
+	}
+}
+
+func (rf *Raft) runLeader() {
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	// Send heartbeats
+	rf.sendHeartbeats(currentTerm)
+
+	// Leader heartbeat interval (shorter than election timeout)
+	time.Sleep(50 * time.Millisecond)
+}
+
+func (rf *Raft) startElection(term int) {
+	args := RequestVoteArgs{
+		Term:        term,
+		CandidateId: rf.me,
+	}
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			reply := RequestVoteReply{}
+			if rf.sendRequestVote(server, &args, &reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// Check if we're still in the same term and state
+				if rf.currentTerm != term || rf.state != Candidate {
+					return
+				}
+
+				if reply.VoteGranted {
+					rf.votesReceived++
+					if rf.votesReceived >= rf.votesNeeded {
+						rf.becomeLeader()
+					}
+				} else if reply.Term > rf.currentTerm {
+					rf.becomeFollower(reply.Term)
+				}
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) sendHeartbeats(term int) {
+	args := AppendEntriesArgs{
+		Term:     term,
+		LeaderID: rf.me,
+	}
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			if rf.sendAppendEntries(server, &args, &reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// Check if we're still leader in the same term
+				if rf.currentTerm != term || rf.state != Leader {
+					return
+				}
+
+				if reply.Term > rf.currentTerm {
+					rf.becomeFollower(reply.Term)
+				}
+			}
+		}(i)
 	}
 }
 
@@ -370,145 +481,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.isleader = false
+	rf.state = Follower
 	rf.dead = 0
+	rf.votesReceived = 0
+	rf.votesNeeded = 0
 
-	rf.toFollower = make(chan struct{})
-	rf.toLeader = make(chan struct{})
 	rf.heartbeatCh = make(chan struct{}, 1)
-	rf.tickerCh = make(chan struct{})
-
-	// start as a follower
-	go FollowerState(rf, rf.currentTerm)
+	rf.electionTimeoutCh = make(chan struct{}, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
+	// start main state machine goroutine
+	go rf.runStateMachine()
 
 	return rf
-}
-
-func FollowerState(rf *Raft, currentTerm int) {
-	Debug(dInfo, "S%d enters follower state for term", rf.me, currentTerm)
-	for {
-		select {
-		case <-rf.toFollower:
-			continue
-		case <-rf.tickerCh:
-			// Here, we can not achieve atomic state switch
-			go rf.SwitchToCandidate()
-			return
-		}
-	}
-}
-
-func CandidateState(rf *Raft, currentTerm int) {
-	Debug(dVote, "S%d enters candidate state for term %d", rf.me, currentTerm)
-	toSub_StopSending := make(chan struct{})
-	go CandidateSendRequestVote(rf, toSub_StopSending, currentTerm, rf.me)
-	for {
-		select {
-		case <-rf.toLeader:
-			toSub_StopSending <- struct{}{}
-			return
-		case <-rf.toFollower:
-			toSub_StopSending <- struct{}{}
-			return
-		case <-rf.tickerCh:
-			toSub_StopSending <- struct{}{}
-			go rf.SwitchToCandidate()
-			return
-		}
-	}
-}
-
-func CandidateSendRequestVote(rf *Raft, toSub_StopSending chan struct{}, currentTerm int, index int) {
-	count := 1
-	args := RequestVoteArgs{currentTerm, index}
-	voteCh := make(chan bool, len(rf.peers))
-	termCh := make(chan int, len(rf.peers))
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go func(server int) {
-			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(server, &args, &reply)
-			if ok {
-				if reply.VoteGranted && reply.Term == currentTerm {
-					voteCh <- true
-				} else if reply.Term > currentTerm {
-					termCh <- reply.Term
-				} else {
-					voteCh <- false
-				}
-			} else {
-				voteCh <- false
-			}
-		}(i)
-	}
-
-	for i := 0; i < len(rf.peers)-1; i++ {
-		select {
-		case <-toSub_StopSending:
-			return
-		case vote := <-voteCh:
-			if vote {
-				count++
-			}
-			if count > len(rf.peers)/2 {
-				rf.SwitchToLeader(currentTerm)
-				return
-			}
-		case newTerm := <-termCh:
-			rf.SwitchToFollower(newTerm)
-			return
-		}
-	}
-}
-
-func LeaderState(rf *Raft, currentTerm int) {
-	Debug(dLeader, "S%d enters leader state for term %d", rf.me, currentTerm)
-	toSub_StopSending := make(chan struct{})
-	go LeaderSendAppendEntries(rf, toSub_StopSending, currentTerm, rf.me)
-	for {
-		select {
-		case <-rf.toFollower:
-			toSub_StopSending <- struct{}{}
-			return
-		case <-rf.tickerCh:
-			toSub_StopSending <- struct{}{}
-			go LeaderSendAppendEntries(rf, toSub_StopSending, currentTerm, rf.me)
-		}
-	}
-}
-
-func LeaderSendAppendEntries(rf *Raft, toSub_StopSending chan struct{}, currentTerm int, index int) {
-	// We should not hold the lock here
-	// In case the term has been modified by other goroutine or RPCs
-	args := AppendEntriesArgs{currentTerm, index}
-	termCh := make(chan int, len(rf.peers))
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go func(server int) {
-			reply := AppendEntriesReply{}
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			if ok && !reply.Success {
-				termCh <- reply.Term
-			}
-		}(i)
-	}
-	for {
-		select {
-		case <-toSub_StopSending:
-			return
-		case newTerm := <-termCh:
-			rf.SwitchToFollower(newTerm)
-			return
-		}
-	}
 }
