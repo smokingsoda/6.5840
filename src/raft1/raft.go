@@ -269,7 +269,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader = (rf.state == LEADER)
 	// Your code here (3B).
 
 	return index, term, isLeader
@@ -298,7 +300,7 @@ func (rf *Raft) electionTicker() {
 	for rf.killed() == false {
 		// Debug info when ticker wakes up
 		Debug(dInfo, "S%d election ticker woke up", rf.me)
-		ms := 50 + (rand.Int63() % 300)
+		ms := 150 + (rand.Int63() % 150)
 		Debug(dTimer, "S%d election ticker sleeping for %dms", rf.me, ms)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
@@ -337,7 +339,7 @@ func (rf *Raft) electionTicker() {
 func (rf *Raft) appendTicker() {
 	for rf.killed() == false {
 		// Debug info when ticker wakes up
-		ms := 25
+		ms := 50
 		Debug(dTimer, "S%d append ticker sleeping for %dms", rf.me, ms)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		Debug(dInfo, "S%d append ticker woke up", rf.me)
@@ -391,8 +393,8 @@ func (rf *Raft) LeaderSendAppendEntries(currentTerm int, index int) {
 	// In case the term has been modified by other goroutine or RPCs
 	Debug(dLeader, "S%d starting to send AppendEntries for term %d", rf.me, currentTerm)
 	args := AppendEntriesArgs{currentTerm, index}
-	termCh := make(chan int, len(rf.peers))
-
+	termCh := make(chan int, len(rf.peers)-1)
+	doneCh := make(chan struct{}, len(rf.peers)-1)
 	Debug(dLeader, "S%d sending AppendEntries to %d peers", rf.me, len(rf.peers)-1)
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -411,17 +413,27 @@ func (rf *Raft) LeaderSendAppendEntries(currentTerm int, index int) {
 			} else {
 				Debug(dLeader, "S%d failed to send AppendEntries to S%d", rf.me, server)
 			}
+			doneCh <- struct{}{}
 		}(i)
 	}
-	select {
-	case newTerm := <-termCh:
-		Debug(dTerm, "S%d received higher term %d, stepping down from leader", rf.me, newTerm)
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if currentTerm == rf.currentTerm {
-			rf.currentTerm = newTerm
-			rf.state = FOLLOWER
-			rf.votedFor = -1
+	count := 1
+	for {
+		select {
+		case newTerm := <-termCh:
+			Debug(dTerm, "S%d received higher term %d, stepping down from leader", rf.me, newTerm)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if currentTerm == rf.currentTerm {
+				rf.currentTerm = newTerm
+				rf.state = FOLLOWER
+				rf.votedFor = -1
+			}
+			return
+		case <-doneCh:
+			count += 1
+			if count >= len(rf.peers) {
+				return
+			}
 		}
 	}
 	return
