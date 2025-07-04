@@ -221,6 +221,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	if args.Entry == EmptyLogEntry {
+		Debug(dLog, "S%d received heartbeat from S%d: term=%d, prevLogIndex=%d, prevLogTerm=%d, entry=[%d,%d]",
+			rf.me, args.LeaderID, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.Entry.Index, args.Entry.Term)
 		// It is an empty entry
 		// Leader is sending the heartbeat
 		if args.Term < currentTerm {
@@ -228,7 +230,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			return
 		} else {
-			reply.Success = true
 			reply.Term = args.Term
 			if args.Term > currentTerm {
 				rf.currentTerm = args.Term
@@ -239,19 +240,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.PrevLogIndex >= len(rf.log) {
 				reply.Success = false
 				reply.Term = rf.currentTerm
-				Debug(dLog, "S%d rejected append entries: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
+				Debug(dLog, "S%d rejected heartbeat: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
+				goto heartbeat
 			}
 			// Check if term matches at prevLogIndex
 			if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 				reply.Success = false
 				reply.Term = rf.currentTerm
-				Debug(dLog, "S%d rejected append entries: term mismatch at index %d, expected %d, got %d",
+				Debug(dLog, "S%d rejected heartbeat: term mismatch at index %d, expected %d, got %d",
 					rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
+				goto heartbeat
 			}
 			if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 				reply.Success = true
 				reply.Term = rf.currentTerm
-				Debug(dLog, "S%d accpeted append entries: term match at index %d, expected %d, got %d",
+				Debug(dLog, "S%d accpeted heartbeat: term match at index %d, expected %d, got %d",
 					rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
 			}
 			// delete the existing entry and all that follow it (§5.3)
@@ -262,6 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
 				Debug(dCommit, "S%d updated commitIndex from %d to %d via heartbeat (leaderCommit=%d)",
 					rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
+				oldApplied := rf.lastApplied
 				for rf.lastApplied < rf.commitIndex {
 					rf.lastApplied++
 					entry := rf.log[rf.lastApplied]
@@ -270,18 +274,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 						Command:      entry.Command,
 						CommandIndex: rf.lastApplied,
 					}
-					Debug(dCommit, "S%d preparing to apply committed entry at index %d via heartbeat", rf.me, rf.lastApplied)
 					rf.applyCh <- applyMsg
 				}
+				Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
 			} else if args.LeaderCommit < rf.commitIndex {
 				panic("leader commit: less than follower's commit")
 			}
-			// Send heartbeat signal to reset election timeout
-			select {
-			case rf.heartbeatCh <- struct{}{}:
-			default:
-			}
-			return
+			goto heartbeat
 		}
 	} else {
 		// Reply false if term is stale
@@ -305,6 +304,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected append entries: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
+			goto heartbeat
 		}
 		// Check if term matches at prevLogIndex
 		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -312,6 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected append entries: term mismatch at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
+			goto heartbeat
 		}
 		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 			reply.Success = true
@@ -343,6 +344,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
 			Debug(dCommit, "S%d updated commitIndex from %d to %d (leaderCommit=%d)",
 				rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
+			oldApplied := rf.lastApplied
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
 				entry := rf.log[rf.lastApplied]
@@ -351,20 +353,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					Command:      entry.Command,
 					CommandIndex: rf.lastApplied,
 				}
-				Debug(dCommit, "S%d preparing to apply committed entry at index %d", rf.me, rf.lastApplied)
 				rf.applyCh <- applyMsg
 			}
+			Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
 		} else if args.LeaderCommit < rf.commitIndex {
 			// Do nothing, because it is out-of-date RPC
 		}
 		reply.Term = rf.currentTerm
-		// Send heartbeat signal to reset election timeout
-		select {
-		case rf.heartbeatCh <- struct{}{}:
-		default:
-		}
-		return
+		goto heartbeat
 	}
+	// Send heartbeat signal to reset election timeout
+heartbeat:
+	select {
+	case rf.heartbeatCh <- struct{}{}:
+	default:
+	}
+	return
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -529,7 +533,7 @@ func (rf *Raft) appendTicker() {
 					rf.lastApplied = i
 				}
 				rf.commitIndex = newCommitIndex
-				Debug(dCommit, "S%d updated commit index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
+				Debug(dCommit, "S%d (leader) commited, index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
 			}
 			rf.leaderSignal.Broadcast()
 		}
@@ -636,9 +640,6 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 						rf.matchIndex[i] = 0
 						go rf.FollowerManager(i)
 					}
-					Debug(dLog, "S%d (leader) initialized nextIndex to %d and matchIndex to 0 for all peers",
-						rf.me, len(rf.log))
-
 				}
 				return
 			}
@@ -664,15 +665,19 @@ func (rf *Raft) FollowerManager(follower int) {
 			rf.mu.Unlock()
 			return
 		}
-		Debug(dLeader, "S%d (leader) to in manager with log len %d, nextIndex[S%d] = %d", rf.me, len(rf.log), follower, rf.nextIndex[follower])
 		for len(rf.log) <= rf.nextIndex[follower] {
 			// No new entries to send, wait for new entries or heartbeat timer
 			if len(rf.log) < rf.nextIndex[follower] {
 				panic(fmt.Sprintf("leader: log len %d less than next index %d", len(rf.log), rf.nextIndex[follower]))
 			}
-			Debug(dLeader, "S%d waiting for new entries or heartbeat timer for S%d (nextIndex=%d, logLen=%d)",
+			Debug(dLeader, "S%d waiting for heartbeat timer for S%d (nextIndex=%d, logLen=%d)",
 				rf.me, follower, rf.nextIndex[follower], len(rf.log))
 			rf.leaderSignal.Wait()
+			if rf.state != LEADER {
+				Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
+				rf.mu.Unlock()
+				return
+			}
 			// Re-read latest values after waking up from Wait()
 			term := rf.currentTerm
 			leaderId := rf.me
@@ -704,8 +709,8 @@ func (rf *Raft) FollowerManager(follower int) {
 			prevLogTerm := rf.log[prevLogIndex].Term
 			leaderCommit := rf.commitIndex
 			entry := rf.log[prevLogIndex+1]
-			Debug(dLog, "S%d sending log entry to S%d: index=%d, term=%d, nextIndex=%d",
-				rf.me, follower, entry.Index, entry.Term, rf.nextIndex[follower])
+			Debug(dLeader, "S%d sending append entries to S%d (term=%d, prevLogIndex=%d, prevLogTerm=%d, leaderCommit=%d)",
+				rf.me, follower, term, prevLogIndex, prevLogTerm, leaderCommit)
 			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
 			reply := AppendEntriesReply{}
 			rf.mu.Unlock()
@@ -750,8 +755,8 @@ func (rf *Raft) LeaderHandleReply(follower int, reply AppendEntriesReply, isHear
 			rf.matchIndex[follower] = rf.nextIndex[follower]
 			Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
 			if rf.nextIndex[follower] < len(rf.log) {
-				Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
 				rf.nextIndex[follower] += 1
+				Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
 			} else {
 				Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log))
 			}
