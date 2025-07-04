@@ -204,7 +204,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.state = FOLLOWER
+		if rf.state == LEADER {
+			rf.state = FOLLOWER
+			rf.leaderSignal.Broadcast()
+		}
 		reply.Term = args.Term
 		if candidateIsUpToDate {
 			reply.VoteGranted = true
@@ -229,59 +232,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			reply.Success = false
 			return
-		} else {
-			reply.Term = args.Term
-			if args.Term > currentTerm {
-				rf.currentTerm = args.Term
-				rf.votedFor = -1
+		}
+		reply.Term = args.Term
+		if args.Term > currentTerm {
+			if rf.state == LEADER {
+				rf.state = FOLLOWER
+				rf.leaderSignal.Broadcast()
 			}
-			rf.state = FOLLOWER
-			// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-			if args.PrevLogIndex >= len(rf.log) {
-				reply.Success = false
-				reply.Term = rf.currentTerm
-				Debug(dLog, "S%d rejected heartbeat: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
-				goto heartbeat
-			}
+			rf.currentTerm = args.Term
+			rf.votedFor = -1
+		}
+		rf.state = FOLLOWER
+		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			Debug(dLog, "S%d rejected heartbeat: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
+		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			// Check if term matches at prevLogIndex
-			if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-				reply.Success = false
-				reply.Term = rf.currentTerm
-				Debug(dLog, "S%d rejected heartbeat: term mismatch at index %d, expected %d, got %d",
-					rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
-				goto heartbeat
-			}
-			if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
-				reply.Success = true
-				reply.Term = rf.currentTerm
-				Debug(dLog, "S%d accpeted heartbeat: term match at index %d, expected %d, got %d",
-					rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
-			}
-			// delete the existing entry and all that follow it (§5.3)
-			if args.LeaderCommit > rf.commitIndex {
-				lastNewEntryIndex := len(rf.log) - 1
-				oldCommitIndex := rf.commitIndex
-				// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-				rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
-				Debug(dCommit, "S%d updated commitIndex from %d to %d via heartbeat (leaderCommit=%d)",
-					rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
-				oldApplied := rf.lastApplied
-				for rf.lastApplied < rf.commitIndex {
-					rf.lastApplied++
-					entry := rf.log[rf.lastApplied]
-					applyMsg := raftapi.ApplyMsg{
-						CommandValid: true,
-						Command:      entry.Command,
-						CommandIndex: rf.lastApplied,
-					}
-					rf.applyCh <- applyMsg
-				}
-				Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
-			} else if args.LeaderCommit < rf.commitIndex {
-				// Do nothing, it is legal
-				// panic("leader commit: less than follower's commit")
-			}
-			goto heartbeat
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			Debug(dLog, "S%d rejected heartbeat: term mismatch at index %d, expected %d, got %d",
+				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
+		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+			reply.Success = true
+			reply.Term = rf.currentTerm
+			Debug(dLog, "S%d accpeted heartbeat: term match at index %d, expected %d, got %d",
+				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
+			rf.FollowerUpdateCommitIndex(*args)
+		} else {
+			panic("unreachable 1")
 		}
 	} else {
 		// Reply false if term is stale
@@ -305,17 +285,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected append entries: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
-			goto heartbeat
-		}
-		// Check if term matches at prevLogIndex
-		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			// Check if term matches at prevLogIndex
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected append entries: term mismatch at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
-			goto heartbeat
-		}
-		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 			reply.Success = true
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d accepted append entries: term match at index %d, expected %d, got %d",
@@ -336,45 +312,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Debug(dLog2, "S%d appended entry at index %d, term %d, log length now %d",
 					rf.me, args.Entry.Index, args.Entry.Term, len(rf.log))
 			}
+			rf.FollowerUpdateCommitIndex(*args)
+		} else {
+			panic("unreachable 2")
 		}
-		// Update commitIndex if leaderCommit > commitIndex
-		// IF WE REPLY FALSE, WE CAN'T ENTER THIS CODE BLOCK
-		// VERRRRRRRRRRRRRRRYYYYYYYYYYYY IMPORTANT
-		// prevLogIndex & prevLogTerm check can guarantee the the follower's log before prevLogIndex
-		// is exactly the same as the leader, then we can update the commitIndex
-		if args.LeaderCommit > rf.commitIndex {
-			lastNewEntryIndex := len(rf.log) - 1
-			oldCommitIndex := rf.commitIndex
-			// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-			rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
-			Debug(dCommit, "S%d updated commitIndex from %d to %d (leaderCommit=%d)",
-				rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
-			oldApplied := rf.lastApplied
-			for rf.lastApplied < rf.commitIndex {
-				rf.lastApplied++
-				entry := rf.log[rf.lastApplied]
-				applyMsg := raftapi.ApplyMsg{
-					CommandValid: true,
-					Command:      entry.Command,
-					CommandIndex: rf.lastApplied,
-				}
-				rf.applyCh <- applyMsg
-			}
-			Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
-		} else if args.LeaderCommit < rf.commitIndex {
-			// Do nothing, because it is out-of-date RPC
-		}
-
-		goto heartbeat
 	}
 	// Send heartbeat signal to reset election timeout
-heartbeat:
-	reply.Term = rf.currentTerm
 	select {
 	case rf.heartbeatCh <- struct{}{}:
 	default:
 	}
-	return
+}
+
+func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs) {
+	// Update commitIndex if leaderCommit > commitIndex
+	// IF WE REPLY FALSE, WE CAN'T ENTER THIS CODE BLOCK
+	// VERRRRRRRRRRRRRRRYYYYYYYYYYYY IMPORTANT
+	// prevLogIndex & prevLogTerm check can guarantee the the follower's log before prevLogIndex
+	// is exactly the same as the leader, then we can update the commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		lastNewEntryIndex := len(rf.log) - 1
+		oldCommitIndex := rf.commitIndex
+		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+		rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
+		Debug(dCommit, "S%d updated commitIndex from %d to %d (leaderCommit=%d)",
+			rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
+		oldApplied := rf.lastApplied
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			entry := rf.log[rf.lastApplied]
+			applyMsg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.applyCh <- applyMsg
+		}
+		Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
+	} else if args.LeaderCommit < rf.commitIndex {
+		// Do nothing, because it is out-of-date RPC
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -482,7 +459,6 @@ func (rf *Raft) electionTicker() {
 		state := rf.state
 		switch state {
 		case CANDIDATE:
-
 			rf.state = CANDIDATE
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
@@ -644,7 +620,7 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 							continue
 						}
 						rf.matchIndex[i] = 0
-						go rf.FollowerManager(i)
+						go rf.FollowerManager(i, rf.currentTerm)
 					}
 				}
 				return
@@ -663,10 +639,12 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 	}
 }
 
-func (rf *Raft) FollowerManager(follower int) {
+func (rf *Raft) FollowerManager(follower int, goroutineTerm int) {
+	// fmt.Printf("S%d entering FollowerManager for S%d\n", rf.me, follower)
+	// defer fmt.Printf("S%d exiting FollowerManager for S%d\n", rf.me, follower)
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state != LEADER {
+		if rf.state != LEADER || goroutineTerm != rf.currentTerm {
 			Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
 			rf.mu.Unlock()
 			return
@@ -679,7 +657,7 @@ func (rf *Raft) FollowerManager(follower int) {
 			Debug(dLeader, "S%d waiting for heartbeat timer for S%d (nextIndex=%d, logLen=%d)",
 				rf.me, follower, rf.nextIndex[follower], len(rf.log))
 			rf.leaderSignal.Wait()
-			if rf.state != LEADER {
+			if rf.state != LEADER || goroutineTerm != rf.currentTerm {
 				Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
 				rf.mu.Unlock()
 				return
@@ -696,12 +674,17 @@ func (rf *Raft) FollowerManager(follower int) {
 			entry := EmptyLogEntry
 			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
 			reply := AppendEntriesReply{}
+			if args.PrevLogIndex != rf.nextIndex[follower]-1 {
+				panic(fmt.Sprintf("333S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
+			}
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(follower, &args, &reply)
 			if ok {
 				Debug(dLeader, "S%d received heartbeat reply from S%d: success=%v, term=%d",
 					rf.me, follower, reply.Success, reply.Term)
-				rf.LeaderHandleReply(follower, reply, true)
+				if !rf.LeaderHandleReply(follower, args, reply, true, goroutineTerm) {
+					return
+				}
 			} else {
 				Debug(dLeader, "S%d failed to send heartbeat to S%d (network error)", rf.me, follower)
 			}
@@ -719,12 +702,17 @@ func (rf *Raft) FollowerManager(follower int) {
 				rf.me, follower, term, prevLogIndex, prevLogTerm, leaderCommit)
 			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
 			reply := AppendEntriesReply{}
+			if args.PrevLogIndex != rf.nextIndex[follower]-1 {
+				panic(fmt.Sprintf("222S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
+			}
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(follower, &args, &reply)
 			if ok {
 				Debug(dLog, "S%d received entry reply from S%d: success=%v, term=%d",
 					rf.me, follower, reply.Success, reply.Term)
-				rf.LeaderHandleReply(follower, reply, false)
+				if !rf.LeaderHandleReply(follower, args, reply, false, goroutineTerm) {
+					return
+				}
 			} else {
 				Debug(dLog, "S%d failed to send entry to S%d (network error)", rf.me, follower)
 			}
@@ -733,12 +721,12 @@ func (rf *Raft) FollowerManager(follower int) {
 	}
 }
 
-func (rf *Raft) LeaderHandleReply(follower int, reply AppendEntriesReply, isHeartBeat bool) {
+func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply AppendEntriesReply, isHeartBeat bool, goroutineTerm int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.state != LEADER {
+	if rf.state != LEADER || goroutineTerm != rf.currentTerm {
 		Debug(dLeader, "S%d is no longer leader, ignoring reply from S%d", rf.me, follower)
-		return
+		return false
 	}
 	currentTerm := rf.currentTerm
 	if !isHeartBeat {
@@ -748,16 +736,19 @@ func (rf *Raft) LeaderHandleReply(follower int, reply AppendEntriesReply, isHear
 				Debug(dTerm, "S%d (leader) discovered higher term %d from S%d, stepping down",
 					rf.me, reply.Term, follower)
 				rf.LeaderSwitchToFollower(reply.Term)
-				return
+				return true
 			} else {
 				// 2. need to decrement nextIndex
 				rf.nextIndex[follower] -= 1
 				Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via APE", rf.me, follower, rf.nextIndex[follower])
-				return
+				return true
 			}
 		} else {
 			// 3. successfully append entries
 			// Check if this is a duplicate reply by ensuring we haven't already processed this entry
+			if args.PrevLogIndex != rf.nextIndex[follower]-1 {
+				panic(fmt.Sprintf("111S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
+			}
 			rf.matchIndex[follower] = rf.nextIndex[follower]
 			Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
 			if rf.nextIndex[follower] < len(rf.log) {
@@ -766,21 +757,21 @@ func (rf *Raft) LeaderHandleReply(follower int, reply AppendEntriesReply, isHear
 			} else {
 				Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log))
 			}
-			return
+			return true
 		}
 	} else {
 		if !reply.Success {
 			if reply.Term > currentTerm {
 				rf.LeaderSwitchToFollower(reply.Term)
-				return
+				return true
 			} else {
 				rf.nextIndex[follower] -= 1
 				Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via heartbeat", rf.me, follower, rf.nextIndex[follower])
-				return
+				return true
 			}
 		} else {
 			// Do nothing
-			return
+			return true
 		}
 	}
 }
