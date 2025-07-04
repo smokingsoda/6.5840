@@ -278,7 +278,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 				Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
 			} else if args.LeaderCommit < rf.commitIndex {
-				panic("leader commit: less than follower's commit")
+				// Do nothing, it is legal
+				// panic("leader commit: less than follower's commit")
 			}
 			goto heartbeat
 		}
@@ -363,11 +364,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else if args.LeaderCommit < rf.commitIndex {
 			// Do nothing, because it is out-of-date RPC
 		}
-		reply.Term = rf.currentTerm
+
 		goto heartbeat
 	}
 	// Send heartbeat signal to reset election timeout
 heartbeat:
+	reply.Term = rf.currentTerm
 	select {
 	case rf.heartbeatCh <- struct{}{}:
 	default:
