@@ -337,6 +337,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		// Update commitIndex if leaderCommit > commitIndex
+		// IF WE REPLY FALSE, WE CAN'T ENTER THIS CODE BLOCK
+		// VERRRRRRRRRRRRRRRYYYYYYYYYYYY IMPORTANT
+		// prevLogIndex & prevLogTerm check can guarantee the the follower's log before prevLogIndex
+		// is exactly the same as the leader, then we can update the commitIndex
 		if args.LeaderCommit > rf.commitIndex {
 			lastNewEntryIndex := len(rf.log) - 1
 			oldCommitIndex := rf.commitIndex
