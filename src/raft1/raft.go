@@ -195,10 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			select {
-			case rf.heartbeatCh <- struct{}{}:
-			default:
-			}
+			rf.AcceptHeartbeat()
 			return
 		} else {
 			reply.Term = rf.currentTerm
@@ -208,18 +205,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		if rf.state == LEADER {
-			rf.state = FOLLOWER
-			rf.leaderSignal.Broadcast()
-		}
+		rf.state = FOLLOWER
 		reply.Term = args.Term
 		if candidateIsUpToDate {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			select {
-			case rf.heartbeatCh <- struct{}{}:
-			default:
-			}
+			rf.AcceptHeartbeat()
 		} else {
 			reply.VoteGranted = false
 		}
@@ -243,10 +234,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.Term = args.Term
 		if args.Term > currentTerm {
-			if rf.state == LEADER {
-				rf.state = FOLLOWER
-				rf.leaderSignal.Broadcast()
-			}
+			rf.state = FOLLOWER
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 		}
@@ -256,18 +244,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected heartbeat: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
+			rf.AcceptHeartbeat()
+			return
 		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			// Check if term matches at prevLogIndex
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected heartbeat: term mismatch at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
+			rf.AcceptHeartbeat()
+			return
 		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 			reply.Success = true
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d accpeted heartbeat: term match at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
 			rf.FollowerUpdateCommitIndex(*args)
+			rf.AcceptHeartbeat()
+			return
 		} else {
 			panic("unreachable 1")
 		}
@@ -293,12 +287,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected append entries: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
+			rf.AcceptHeartbeat()
+			return
 		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			// Check if term matches at prevLogIndex
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d rejected append entries: term mismatch at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
+			rf.AcceptHeartbeat()
+			return
 		} else if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 			reply.Success = true
 			reply.Term = rf.currentTerm
@@ -321,11 +319,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					rf.me, args.Entry.Index, args.Entry.Term, len(rf.log))
 			}
 			rf.FollowerUpdateCommitIndex(*args)
+			rf.AcceptHeartbeat()
+			return
 		} else {
 			panic("unreachable 2")
 		}
 	}
-	// Send heartbeat signal to reset election timeout
+}
+
+func (rf *Raft) AcceptHeartbeat() {
 	select {
 	case rf.heartbeatCh <- struct{}{}:
 	default:
@@ -461,7 +463,6 @@ func (rf *Raft) electionTicker() {
 		// Debug info when ticker wakes up
 
 		ms := 150 + (rand.Int63() % 150)
-
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
 		state := rf.state
@@ -471,20 +472,22 @@ func (rf *Raft) electionTicker() {
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
 			go rf.CandidateSendRequestVote(rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
+			rf.AcceptHeartbeat()
 		case FOLLOWER:
-			Debug(dInfo, "S%d enters follower state for term %d", rf.me, rf.currentTerm)
+			Debug(dLog, "S%d enters follower state for term %d", rf.me, rf.currentTerm)
 			// Check if we received a heartbeat during this election timeout period
 			select {
 			case <-rf.heartbeatCh:
 				// Received heartbeat, reset election timeout
-				Debug(dInfo, "S%d received heartbeat, resetting election timeout", rf.me)
+				Debug(dLog, "S%d received heartbeat, resetting election timeout", rf.me)
 			default:
 				// No heartbeat received, start election
 				rf.state = CANDIDATE
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
-				Debug(dInfo, "S%d election timeout, starting election for term %d", rf.me, rf.currentTerm)
+				Debug(dLog, "S%d election timeout, starting election for term %d", rf.me, rf.currentTerm)
 				go rf.CandidateSendRequestVote(rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
+				rf.AcceptHeartbeat()
 			}
 		}
 		// Your code here (3A)
@@ -506,8 +509,20 @@ func (rf *Raft) appendTicker() {
 		switch state {
 		case LEADER:
 			// first of all, we need to commit, according to the matchIndex
-			rf.leaderSignal.Broadcast()
-			Debug(dCommit, "S%d (leader) heartbeat ticker knocks", rf.me)
+			Debug(dLeader, "S%d (leader) heartbeat ticker knocks", rf.me)
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				term := rf.currentTerm
+				leaderId := rf.me
+				prevLogIndex := rf.nextIndex[i] - 1
+				prevLogTerm := rf.log[prevLogIndex].Term
+				leaderCommit := rf.commitIndex
+				args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, EmptyLogEntry, leaderCommit}
+				reply := AppendEntriesReply{}
+				go rf.LeaderSendAndHandle(i, args, reply, true, term)
+			}
 			matchIndexCopy := make([]int, len(rf.matchIndex))
 			copy(matchIndexCopy, rf.matchIndex)
 			sort.Ints(matchIndexCopy)
@@ -629,7 +644,15 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 							continue
 						}
 						rf.matchIndex[i] = 0
-						go rf.FollowerManager(i, rf.currentTerm)
+						term := rf.currentTerm
+						leaderId := rf.me
+						prevLogIndex := rf.nextIndex[i] - 1
+						prevLogTerm := rf.log[prevLogIndex].Term
+						leaderCommit := rf.commitIndex
+						args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, EmptyLogEntry, leaderCommit}
+						reply := AppendEntriesReply{}
+						go rf.LeaderSendAndHandle(i, args, reply, true, term)
+						go rf.FollowerManager(i, term)
 					}
 				}
 				return
@@ -658,33 +681,7 @@ func (rf *Raft) FollowerManager(follower int, goroutineTerm int) {
 			Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
 			return
 		}
-		for len(rf.log) <= rf.nextIndex[follower] {
-			// No new entries to send, wait for new entries or heartbeat timer
-			if rf.state != LEADER || goroutineTerm != rf.currentTerm {
-				Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
-				return
-			}
-			if len(rf.log) < rf.nextIndex[follower] {
-				panic(fmt.Sprintf("leader: log len %d less than next index %d", len(rf.log), rf.nextIndex[follower]))
-			}
-			// Re-read latest values after waking up from Wait()
-			term := goroutineTerm
-			leaderId := rf.me
-			prevLogIndex := rf.nextIndex[follower] - 1
-			prevLogTerm := rf.log[prevLogIndex].Term
-			leaderCommit := rf.commitIndex
-			// woken up by ticker, send heartbeat
-			Debug(dLeader, "S%d sending heartbeat to S%d (term=%d, prevLogIndex=%d, prevLogTerm=%d, leaderCommit=%d)",
-				rf.me, follower, term, prevLogIndex, prevLogTerm, leaderCommit)
-			entry := EmptyLogEntry
-			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
-			reply := AppendEntriesReply{}
-			go rf.LeaderSendAndHandle(follower, args, reply, true, goroutineTerm)
-			Debug(dLeader, "S%d waiting for ticker (sent heartbeat) for S%d (nextIndex=%d, logLen=%d)",
-				rf.me, follower, rf.nextIndex[follower], len(rf.log))
-			rf.leaderSignal.Wait()
-		}
-		for len(rf.log) > rf.nextIndex[follower] {
+		if len(rf.log) > rf.nextIndex[follower] {
 			// woken up by start(), send entry
 			term := goroutineTerm
 			leaderId := rf.me
@@ -700,15 +697,22 @@ func (rf *Raft) FollowerManager(follower int, goroutineTerm int) {
 				Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
 				return
 			}
+			rf.mu.Unlock()
 			go rf.LeaderSendAndHandle(follower, args, reply, false, goroutineTerm)
 			Debug(dLeader, "S%d waiting for ticker (sent APE) for S%d (nextIndex=%d, logLen=%d)",
 				rf.me, follower, rf.nextIndex[follower], len(rf.log))
-			rf.leaderSignal.Wait()
+			rf.mu.Lock()
 		}
+		rf.leaderSignal.Wait()
 	}
 }
 
 func (rf *Raft) LeaderSendAndHandle(follower int, args AppendEntriesArgs, reply AppendEntriesReply, isHeartBeat bool, goroutineTerm int) {
+	if !isHeartBeat {
+		Debug(dLog, "S%d sending entry to S%d (prevLogIndex=%d)", rf.me, follower, args.PrevLogIndex)
+	} else {
+		Debug(dLog, "S%d sending heartbeat to S%d", rf.me, follower)
+	}
 	ok := rf.sendAppendEntries(follower, &args, &reply)
 	if !isHeartBeat {
 		if ok {
