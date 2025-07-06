@@ -205,6 +205,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		if rf.state == LEADER {
+			Debug(dLeader, "S%d stepping down due to higher term by RequestVote %d", rf.me, args.Term)
+		}
 		rf.state = FOLLOWER
 		reply.Term = args.Term
 		if candidateIsUpToDate {
@@ -234,9 +237,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.Term = args.Term
 		if args.Term > currentTerm {
+			if rf.state == LEADER {
+				Debug(dLeader, "S%d stepping down due to higher term by heartbeat %d", rf.me, args.Term)
+			}
 			rf.state = FOLLOWER
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
+
 		}
 		rf.state = FOLLOWER
 		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
@@ -259,7 +266,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d accpeted heartbeat: term match at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
-			rf.FollowerUpdateCommitIndex(*args)
+			// rf.FollowerUpdateCommitIndex(*args)
 			rf.AcceptHeartbeat()
 			return
 		} else {
@@ -279,6 +286,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.Term > currentTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
+			if rf.state == LEADER {
+				Debug(dLeader, "S%d stepping down due to higher term by AppendEntries %d", rf.me, args.Term)
+			}
+			rf.state = FOLLOWER
 			Debug(dTerm, "S%d updated term from %d to %d due to append entries", rf.me, currentTerm, args.Term)
 		}
 		rf.state = FOLLOWER
@@ -317,8 +328,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = append(rf.log, args.Entry)
 				Debug(dLog2, "S%d appended entry at index %d, term %d, log length now %d",
 					rf.me, args.Entry.Index, args.Entry.Term, len(rf.log))
+				rf.FollowerUpdateCommitIndex(*args)
 			}
-			rf.FollowerUpdateCommitIndex(*args)
 			rf.AcceptHeartbeat()
 			return
 		} else {
@@ -432,7 +443,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.me, index, term, len(rf.log))
 		Debug(dLog, "S%d (leader) starting log replication for entry at index %d to %d followers",
 			rf.me, index, len(rf.peers)-1)
-		rf.leaderSignal.Broadcast()
 	} else {
 		Debug(dLog, "S%d rejected Start() call: not leader (state=%d)", rf.me, rf.state)
 	}
@@ -461,7 +471,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) electionTicker() {
 	for rf.killed() == false {
 		// Debug info when ticker wakes up
-
 		ms := 150 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
@@ -474,7 +483,6 @@ func (rf *Raft) electionTicker() {
 			go rf.CandidateSendRequestVote(rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
 			rf.AcceptHeartbeat()
 		case FOLLOWER:
-			Debug(dLog, "S%d enters follower state for term %d", rf.me, rf.currentTerm)
 			// Check if we received a heartbeat during this election timeout period
 			select {
 			case <-rf.heartbeatCh:
@@ -521,26 +529,7 @@ func (rf *Raft) appendTicker() {
 				leaderCommit := rf.commitIndex
 				args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, EmptyLogEntry, leaderCommit}
 				reply := AppendEntriesReply{}
-				go rf.LeaderSendAndHandle(i, args, reply, true, term)
-			}
-			matchIndexCopy := make([]int, len(rf.matchIndex))
-			copy(matchIndexCopy, rf.matchIndex)
-			sort.Ints(matchIndexCopy)
-			newCommitIndex := matchIndexCopy[len(rf.peers)/2]
-			Debug(dCommit, "S%d checking commit index, current=%d, potential=%d", rf.me, rf.commitIndex, newCommitIndex)
-			if newCommitIndex > rf.commitIndex && newCommitIndex < len(rf.log) && rf.log[newCommitIndex].Term == rf.currentTerm {
-				oldCommitIndex := rf.commitIndex
-				for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
-					msg := raftapi.ApplyMsg{
-						CommandValid: true,
-						Command:      rf.log[i].Command,
-						CommandIndex: i,
-					}
-					rf.applyCh <- msg
-					rf.lastApplied = i
-				}
-				rf.commitIndex = newCommitIndex
-				Debug(dCommit, "S%d (leader) commited, index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
+				go rf.LeaderSendAndHandle(i, args, reply, term)
 			}
 		}
 		rf.mu.Unlock()
@@ -651,8 +640,7 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 						leaderCommit := rf.commitIndex
 						args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, EmptyLogEntry, leaderCommit}
 						reply := AppendEntriesReply{}
-						go rf.LeaderSendAndHandle(i, args, reply, true, term)
-						go rf.FollowerManager(i, term)
+						go rf.LeaderSendAndHandle(i, args, reply, term)
 					}
 				}
 				return
@@ -671,125 +659,104 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 	}
 }
 
-func (rf *Raft) FollowerManager(follower int, goroutineTerm int) {
-	// fmt.Printf("S%d entering FollowerManager for S%d\n", rf.me, follower)
-	// defer fmt.Printf("S%d exiting FollowerManager for S%d\n", rf.me, follower)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	for !rf.killed() {
-		if rf.state != LEADER || goroutineTerm != rf.currentTerm {
-			Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
-			return
-		}
-		if len(rf.log) > rf.nextIndex[follower] {
-			// woken up by start(), send entry
-			term := goroutineTerm
-			leaderId := rf.me
-			prevLogIndex := rf.nextIndex[follower] - 1
-			prevLogTerm := rf.log[prevLogIndex].Term
-			leaderCommit := rf.commitIndex
-			entry := rf.log[prevLogIndex+1]
-			Debug(dLeader, "S%d sending append entries to S%d (term=%d, prevLogIndex=%d, prevLogTerm=%d, leaderCommit=%d)",
-				rf.me, follower, term, prevLogIndex, prevLogTerm, leaderCommit)
-			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
-			reply := AppendEntriesReply{}
-			if rf.state != LEADER || goroutineTerm != rf.currentTerm {
-				Debug(dLeader, "S%d no longer leader, exiting FollowerManager for S%d", rf.me, follower)
-				return
-			}
-			rf.mu.Unlock()
-			go rf.LeaderSendAndHandle(follower, args, reply, false, goroutineTerm)
-			Debug(dLeader, "S%d waiting for ticker (sent APE) for S%d (nextIndex=%d, logLen=%d)",
-				rf.me, follower, rf.nextIndex[follower], len(rf.log))
-			rf.mu.Lock()
-		}
-		rf.leaderSignal.Wait()
-	}
-}
-
-func (rf *Raft) LeaderSendAndHandle(follower int, args AppendEntriesArgs, reply AppendEntriesReply, isHeartBeat bool, goroutineTerm int) {
-	if !isHeartBeat {
+func (rf *Raft) LeaderSendAndHandle(follower int, args AppendEntriesArgs, reply AppendEntriesReply, goroutineTerm int) {
+	if args.Entry != EmptyLogEntry {
 		Debug(dLog, "S%d sending entry to S%d (prevLogIndex=%d)", rf.me, follower, args.PrevLogIndex)
 	} else {
 		Debug(dLog, "S%d sending heartbeat to S%d", rf.me, follower)
 	}
 	ok := rf.sendAppendEntries(follower, &args, &reply)
-	if !isHeartBeat {
-		if ok {
-			Debug(dLog, "S%d received entry reply from S%d: success=%v, term=%d",
-				rf.me, follower, reply.Success, reply.Term)
-			if !rf.LeaderHandleReply(follower, args, reply, isHeartBeat, goroutineTerm) {
-				rf.leaderSignal.Broadcast()
-				return
-			}
-		} else {
-			Debug(dLog, "S%d failed to send entry to S%d (network error)", rf.me, follower)
-			rf.leaderSignal.Broadcast()
-		}
+	if ok {
+		Debug(dLog, "S%d received entry reply from S%d: success=%v, term=%d",
+			rf.me, follower, reply.Success, reply.Term)
+		rf.LeaderHandleReply(follower, args, reply, goroutineTerm)
 	} else {
-		if ok {
-			Debug(dLog, "S%d received entry reply from S%d: success=%v, term=%d",
-				rf.me, follower, reply.Success, reply.Term)
-			if !rf.LeaderHandleReply(follower, args, reply, isHeartBeat, goroutineTerm) {
-				rf.leaderSignal.Broadcast()
-				return
-			}
-		} else {
-			Debug(dLog, "S%d failed to send entry to S%d (network error)", rf.me, follower)
-			rf.leaderSignal.Broadcast()
-		}
+		Debug(dLog, "S%d failed to send entry to S%d (network error)", rf.me, follower)
 	}
 
 }
 
-func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply AppendEntriesReply, isHeartBeat bool, goroutineTerm int) bool {
+func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply AppendEntriesReply, goroutineTerm int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	// Check the term
-	if !reply.Success && reply.Term > currentTerm {
+	if reply.Term > currentTerm {
 		// 1. maybe the leader's term need to update
+		if reply.Success {
+			panic("leader: higher term with successful reply")
+		}
 		Debug(dTerm, "S%d (leader) discovered higher term %d from S%d, stepping down",
 			rf.me, reply.Term, follower)
 		rf.LeaderSwitchToFollower(reply.Term)
-		return false
+		return
 	}
 	if rf.state != LEADER || goroutineTerm != rf.currentTerm || args.PrevLogIndex != rf.nextIndex[follower]-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		Debug(dLeader, "S%d (leader) rceived invalied reply from S%d", rf.me, follower)
-		return false
+		return
 	}
-	if !isHeartBeat {
-		if !reply.Success {
-			// 2. need to decrement nextIndex
-			rf.nextIndex[follower] -= 1
-			Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via APE", rf.me, follower, rf.nextIndex[follower])
-			return true
-		} else {
-			// 3. successfully append entries
-			// Check if this is a duplicate reply by ensuring we haven't already processed this entry
-			if args.PrevLogIndex != rf.nextIndex[follower]-1 {
-				panic(fmt.Sprintf("111S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
-			}
-			rf.matchIndex[follower] = rf.nextIndex[follower]
-			Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
-			if rf.nextIndex[follower] < len(rf.log) {
-				rf.nextIndex[follower] += 1
-				Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
-			} else {
-				Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log))
-			}
-			return true
-		}
+	if !reply.Success {
+		// 2. need to decrement nextIndex
+		rf.nextIndex[follower] -= 1
+		Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via APE", rf.me, follower, rf.nextIndex[follower])
+		newArgs := args
+		newArgs.PrevLogIndex = args.PrevLogIndex - 1
+		newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
+		newArgs.Entry = rf.log[rf.nextIndex[follower]]
+		newReply := AppendEntriesReply{}
+		Debug(dLog, "S%d sending new entry to S%d (prevLogIndex=%d)", rf.me, follower, newArgs.PrevLogIndex)
+		go rf.LeaderSendAndHandle(follower, newArgs, newReply, goroutineTerm)
+		return
 	} else {
-		if !reply.Success {
-			rf.nextIndex[follower] -= 1
-			Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via heartbeat", rf.me, follower, rf.nextIndex[follower])
-			return true
-
-		} else {
-			// Do nothing
-			return true
+		// 3. successfully append entries
+		// Check if this is a duplicate reply by ensuring we haven't already processed this entry
+		if args.PrevLogIndex != rf.nextIndex[follower]-1 {
+			panic(fmt.Sprintf("111S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
 		}
+		if args.Entry == EmptyLogEntry && args.PrevLogIndex == len(rf.log)-1 {
+			return
+		}
+		rf.matchIndex[follower] = rf.nextIndex[follower]
+		Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
+		if rf.nextIndex[follower] < len(rf.log) {
+			rf.nextIndex[follower] += 1
+			Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
+		} else {
+			Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log))
+		}
+		rf.LeaderCommit()
+		if rf.nextIndex[follower] < len(rf.log) {
+			newArgs := args
+			newArgs.PrevLogIndex = args.PrevLogIndex + 1
+			newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
+			newArgs.Entry = rf.log[rf.nextIndex[follower]]
+			newReply := AppendEntriesReply{}
+			Debug(dLog, "S%d sending new entry to S%d (prevLogIndex=%d)", rf.me, follower, newArgs.PrevLogIndex)
+			go rf.LeaderSendAndHandle(follower, newArgs, newReply, goroutineTerm)
+		}
+		return
+	}
+}
+
+func (rf *Raft) LeaderCommit() {
+	matchIndexCopy := make([]int, len(rf.matchIndex))
+	copy(matchIndexCopy, rf.matchIndex)
+	sort.Ints(matchIndexCopy)
+	newCommitIndex := matchIndexCopy[len(rf.peers)/2]
+	Debug(dCommit, "S%d checking commit index, current=%d, potential=%d", rf.me, rf.commitIndex, newCommitIndex)
+	if newCommitIndex > rf.commitIndex && newCommitIndex < len(rf.log) && rf.log[newCommitIndex].Term == rf.currentTerm {
+		oldCommitIndex := rf.commitIndex
+		Debug(dCommit, "S%d (leader) ready to commit, index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
+		for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
+			rf.applyCh <- msg
+			rf.lastApplied = i
+		}
+		rf.commitIndex = newCommitIndex
 	}
 }
 
