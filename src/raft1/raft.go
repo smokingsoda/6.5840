@@ -243,7 +243,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.state = FOLLOWER
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
-
 		}
 		rf.state = FOLLOWER
 		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
@@ -266,7 +265,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			Debug(dLog, "S%d accpeted heartbeat: term match at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
-			// rf.FollowerUpdateCommitIndex(*args)
+			newCommitIndex := min(args.LeaderCommit, args.PrevLogIndex)
+			rf.FollowerUpdateCommitIndex(*args, newCommitIndex)
 			rf.AcceptHeartbeat()
 			return
 		} else {
@@ -321,6 +321,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = rf.log[:args.Entry.Index]
 				Debug(dLog2, "S%d found conflict at index %d, truncated log from %d to %d",
 					rf.me, args.Entry.Index, oldLen, len(rf.log))
+			} else if args.Entry.Index >= len(rf.log) {
+				oldLen := len(rf.log)
+				rf.log = rf.log[:args.Entry.Index]
+				Debug(dLog2, "S%d found log longer after index %d, truncated log from %d to %d",
+					rf.me, args.Entry.Index, oldLen, len(rf.log))
 			}
 			// Append new entry
 			if args.Entry.Index == len(rf.log) {
@@ -328,7 +333,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = append(rf.log, args.Entry)
 				Debug(dLog2, "S%d appended entry at index %d, term %d, log length now %d",
 					rf.me, args.Entry.Index, args.Entry.Term, len(rf.log))
-				rf.FollowerUpdateCommitIndex(*args)
+				newCommitIndex := min(args.LeaderCommit, len(rf.log)-1)
+				rf.FollowerUpdateCommitIndex(*args, newCommitIndex)
 			}
 			rf.AcceptHeartbeat()
 			return
@@ -345,17 +351,20 @@ func (rf *Raft) AcceptHeartbeat() {
 	}
 }
 
-func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs) {
+func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs, newCommitIndex int) {
+	// Add debug info to show the values regardless of condition
+	Debug(dCommit, "S%d FollowerUpdateCommitIndex called: leaderCommit=%d, rf.commitIndex=%d",
+		rf.me, args.LeaderCommit, rf.commitIndex)
+
 	// Update commitIndex if leaderCommit > commitIndex
 	// IF WE REPLY FALSE, WE CAN'T ENTER THIS CODE BLOCK
 	// VERRRRRRRRRRRRRRRYYYYYYYYYYYY IMPORTANT
 	// prevLogIndex & prevLogTerm check can guarantee the the follower's log before prevLogIndex
 	// is exactly the same as the leader, then we can update the commitIndex
 	if args.LeaderCommit > rf.commitIndex {
-		lastNewEntryIndex := len(rf.log) - 1
 		oldCommitIndex := rf.commitIndex
 		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-		rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
+		rf.commitIndex = min(args.LeaderCommit, newCommitIndex)
 		Debug(dCommit, "S%d updated commitIndex from %d to %d (leaderCommit=%d)",
 			rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
 		oldApplied := rf.lastApplied
@@ -372,6 +381,12 @@ func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs) {
 		Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
 	} else if args.LeaderCommit < rf.commitIndex {
 		// Do nothing, because it is out-of-date RPC
+		Debug(dCommit, "S%d ignoring stale leaderCommit %d < rf.commitIndex %d",
+			rf.me, args.LeaderCommit, rf.commitIndex)
+	} else {
+		// args.LeaderCommit == rf.commitIndex
+		Debug(dCommit, "S%d leaderCommit %d == rf.commitIndex %d, no update needed",
+			rf.me, args.LeaderCommit, rf.commitIndex)
 	}
 }
 
@@ -443,6 +458,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.me, index, term, len(rf.log))
 		Debug(dLog, "S%d (leader) starting log replication for entry at index %d to %d followers",
 			rf.me, index, len(rf.peers)-1)
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			term := rf.currentTerm
+			leaderId := rf.me
+			prevLogIndex := rf.nextIndex[i] - 1
+			prevLogTerm := rf.log[prevLogIndex].Term
+			leaderCommit := rf.commitIndex
+			entry := rf.log[rf.nextIndex[i]]
+			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
+			reply := AppendEntriesReply{}
+			go rf.LeaderSendAndHandle(i, args, reply, term)
+		}
 	} else {
 		Debug(dLog, "S%d rejected Start() call: not leader (state=%d)", rf.me, rf.state)
 	}
@@ -672,6 +701,10 @@ func (rf *Raft) LeaderSendAndHandle(follower int, args AppendEntriesArgs, reply 
 		rf.LeaderHandleReply(follower, args, reply, goroutineTerm)
 	} else {
 		Debug(dLog, "S%d failed to send entry to S%d (network error)", rf.me, follower)
+		if args.Entry == EmptyLogEntry {
+			return
+		}
+		go rf.LeaderSendAndHandle(follower, args, reply, goroutineTerm)
 	}
 
 }
@@ -703,6 +736,7 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 		newArgs.PrevLogIndex = args.PrevLogIndex - 1
 		newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
 		newArgs.Entry = rf.log[rf.nextIndex[follower]]
+		newArgs.LeaderCommit = rf.commitIndex
 		newReply := AppendEntriesReply{}
 		Debug(dLog, "S%d sending new entry to S%d (prevLogIndex=%d)", rf.me, follower, newArgs.PrevLogIndex)
 		go rf.LeaderSendAndHandle(follower, newArgs, newReply, goroutineTerm)
@@ -713,23 +747,26 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 		if args.PrevLogIndex != rf.nextIndex[follower]-1 {
 			panic(fmt.Sprintf("111S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
 		}
-		if args.Entry == EmptyLogEntry && args.PrevLogIndex == len(rf.log)-1 {
-			return
-		}
-		rf.matchIndex[follower] = rf.nextIndex[follower]
-		Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
-		if rf.nextIndex[follower] < len(rf.log) {
+		if args.Entry != EmptyLogEntry && rf.nextIndex[follower] < len(rf.log) {
+			rf.matchIndex[follower] = rf.nextIndex[follower]
 			rf.nextIndex[follower] += 1
 			Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
+			Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
 		} else {
-			Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log))
+			if args.Entry != EmptyLogEntry {
+			} else {
+				Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log))
+			}
 		}
-		rf.LeaderCommit()
+		if args.Entry != EmptyLogEntry {
+			rf.LeaderCommit()
+		}
 		if rf.nextIndex[follower] < len(rf.log) {
 			newArgs := args
 			newArgs.PrevLogIndex = args.PrevLogIndex + 1
 			newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
 			newArgs.Entry = rf.log[rf.nextIndex[follower]]
+			newArgs.LeaderCommit = rf.commitIndex
 			newReply := AppendEntriesReply{}
 			Debug(dLog, "S%d sending new entry to S%d (prevLogIndex=%d)", rf.me, follower, newArgs.PrevLogIndex)
 			go rf.LeaderSendAndHandle(follower, newArgs, newReply, goroutineTerm)
