@@ -456,22 +456,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = len(rf.log) - 1
 		Debug(dLog, "S%d (leader) appended new entry at index %d, term %d, log length now %d",
 			rf.me, index, term, len(rf.log))
-		Debug(dLog, "S%d (leader) starting log replication for entry at index %d to %d followers",
-			rf.me, index, len(rf.peers)-1)
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			term := rf.currentTerm
-			leaderId := rf.me
-			prevLogIndex := rf.nextIndex[i] - 1
-			prevLogTerm := rf.log[prevLogIndex].Term
-			leaderCommit := rf.commitIndex
-			entry := rf.log[rf.nextIndex[i]]
-			args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
-			reply := AppendEntriesReply{}
-			go rf.LeaderSendAndHandle(i, args, reply, term)
-		}
+		Debug(dLog, "S%d (leader) new entry added, will be replicated by heartbeat mechanism",
+			rf.me)
+		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
+		// This significantly reduces the number of RPC calls
 	} else {
 		Debug(dLog, "S%d rejected Start() call: not leader (state=%d)", rf.me, rf.state)
 	}
@@ -556,7 +544,13 @@ func (rf *Raft) appendTicker() {
 				prevLogIndex := rf.nextIndex[i] - 1
 				prevLogTerm := rf.log[prevLogIndex].Term
 				leaderCommit := rf.commitIndex
-				args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, EmptyLogEntry, leaderCommit}
+
+				// Check if there are entries to send during heartbeat
+				entry := EmptyLogEntry
+				if rf.nextIndex[i] < len(rf.log) {
+					entry = rf.log[rf.nextIndex[i]]
+				}
+				args := AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit}
 				reply := AppendEntriesReply{}
 				go rf.LeaderSendAndHandle(i, args, reply, term)
 			}
@@ -701,12 +695,9 @@ func (rf *Raft) LeaderSendAndHandle(follower int, args AppendEntriesArgs, reply 
 		rf.LeaderHandleReply(follower, args, reply, goroutineTerm)
 	} else {
 		Debug(dLog, "S%d failed to send entry to S%d (network error)", rf.me, follower)
-		if args.Entry == EmptyLogEntry {
-			return
-		}
-		go rf.LeaderSendAndHandle(follower, args, reply, goroutineTerm)
+		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
+		// This significantly reduces the number of RPC calls
 	}
-
 }
 
 func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply AppendEntriesReply, goroutineTerm int) {
@@ -725,22 +716,15 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 		return
 	}
 	if rf.state != LEADER || goroutineTerm != rf.currentTerm || args.PrevLogIndex != rf.nextIndex[follower]-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		Debug(dLeader, "S%d (leader) rceived invalied reply from S%d", rf.me, follower)
+		Debug(dLeader, "S%d (leader) received invalid reply from S%d", rf.me, follower)
 		return
 	}
 	if !reply.Success {
 		// 2. need to decrement nextIndex
 		rf.nextIndex[follower] -= 1
 		Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via APE", rf.me, follower, rf.nextIndex[follower])
-		newArgs := args
-		newArgs.PrevLogIndex = args.PrevLogIndex - 1
-		newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
-		newArgs.Entry = rf.log[rf.nextIndex[follower]]
-		newArgs.LeaderCommit = rf.commitIndex
-		newReply := AppendEntriesReply{}
-		Debug(dLog, "S%d sending new entry to S%d (prevLogIndex=%d)", rf.me, follower, newArgs.PrevLogIndex)
-		go rf.LeaderSendAndHandle(follower, newArgs, newReply, goroutineTerm)
-		return
+		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
+		// This significantly reduces the number of RPC calls
 	} else {
 		// 3. successfully append entries
 		// Check if this is a duplicate reply by ensuring we haven't already processed this entry
@@ -761,16 +745,8 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 		if args.Entry != EmptyLogEntry {
 			rf.LeaderCommit()
 		}
-		if rf.nextIndex[follower] < len(rf.log) {
-			newArgs := args
-			newArgs.PrevLogIndex = args.PrevLogIndex + 1
-			newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
-			newArgs.Entry = rf.log[rf.nextIndex[follower]]
-			newArgs.LeaderCommit = rf.commitIndex
-			newReply := AppendEntriesReply{}
-			Debug(dLog, "S%d sending new entry to S%d (prevLogIndex=%d)", rf.me, follower, newArgs.PrevLogIndex)
-			go rf.LeaderSendAndHandle(follower, newArgs, newReply, goroutineTerm)
-		}
+		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
+		// This significantly reduces the number of RPC calls
 		return
 	}
 }
