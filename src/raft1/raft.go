@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
+
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -99,6 +102,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+	Debug(dPersist, "S%d save persisted state", rf.me)
 }
 
 // restore previously persisted state.
@@ -119,6 +130,23 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		Debug(dPersist, "S%d failed to decode persisted state, using defaults", rf.me)
+		return
+	} else {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		Debug(dPersist, "S%d decode persisted state", rf.me)
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
+
 }
 
 // how many bytes in Raft's persisted log?
@@ -195,6 +223,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
+			rf.persist()
 			rf.AcceptHeartbeat()
 			return
 		} else {
@@ -205,6 +234,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 		if rf.state == LEADER {
 			Debug(dLeader, "S%d stepping down due to higher term by RequestVote %d", rf.me, args.Term)
 		}
@@ -213,6 +243,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if candidateIsUpToDate {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
+			rf.persist()
 			rf.AcceptHeartbeat()
 		} else {
 			reply.VoteGranted = false
@@ -243,6 +274,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.state = FOLLOWER
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
+			rf.persist()
 		}
 		rf.state = FOLLOWER
 		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
@@ -286,6 +318,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.Term > currentTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
+			rf.persist()
 			if rf.state == LEADER {
 				Debug(dLeader, "S%d stepping down due to higher term by AppendEntries %d", rf.me, args.Term)
 			}
@@ -319,11 +352,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// Conflict found, truncate log
 				oldLen := len(rf.log)
 				rf.log = rf.log[:args.Entry.Index]
+				rf.persist()
 				Debug(dLog2, "S%d found conflict at index %d, truncated log from %d to %d",
 					rf.me, args.Entry.Index, oldLen, len(rf.log))
 			} else if args.Entry.Index >= len(rf.log) {
 				oldLen := len(rf.log)
 				rf.log = rf.log[:args.Entry.Index]
+				rf.persist()
 				Debug(dLog2, "S%d found log longer after index %d, truncated log from %d to %d",
 					rf.me, args.Entry.Index, oldLen, len(rf.log))
 			}
@@ -331,6 +366,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.Entry.Index == len(rf.log) {
 				reply.Success = true
 				rf.log = append(rf.log, args.Entry)
+				rf.persist()
 				Debug(dLog2, "S%d appended entry at index %d, term %d, log length now %d",
 					rf.me, args.Entry.Index, args.Entry.Term, len(rf.log))
 				newCommitIndex := min(args.LeaderCommit, len(rf.log)-1)
@@ -452,6 +488,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		newEntry := LogEntry{term, index, command}
 		rf.log = append(rf.log, newEntry)
+		rf.persist()
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		index = len(rf.log) - 1
 		Debug(dLog, "S%d (leader) appended new entry at index %d, term %d, log length now %d",
@@ -497,6 +534,7 @@ func (rf *Raft) electionTicker() {
 			rf.state = CANDIDATE
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
+			rf.persist()
 			go rf.CandidateSendRequestVote(rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
 			rf.AcceptHeartbeat()
 		case FOLLOWER:
@@ -510,6 +548,7 @@ func (rf *Raft) electionTicker() {
 				rf.state = CANDIDATE
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
+				rf.persist()
 				Debug(dLog, "S%d election timeout, starting election for term %d", rf.me, rf.currentTerm)
 				go rf.CandidateSendRequestVote(rf.currentTerm, rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Term)
 				rf.AcceptHeartbeat()
@@ -581,7 +620,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.dead = 0
 	rf.log = make([]LogEntry, 0) // log
-	rf.log = append(rf.log, LogEntry{0, 0, struct{}{}})
+	rf.log = append(rf.log, LogEntry{0, 0, nil})
 
 	// volatile state on all servers
 	rf.commitIndex = 0
@@ -675,6 +714,7 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 				rf.currentTerm = newTerm
 				rf.state = FOLLOWER
 				rf.votedFor = -1
+				rf.persist()
 				Debug(dVote, "S%d (candidate) stepping down due to higher term %d", rf.me, newTerm)
 			}
 			return
@@ -778,5 +818,6 @@ func (rf *Raft) LeaderSwitchToFollower(term int) {
 		rf.currentTerm = term
 		rf.state = FOLLOWER
 		rf.votedFor = -1
+		rf.persist()
 	}
 }
