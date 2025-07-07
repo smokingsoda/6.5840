@@ -54,7 +54,9 @@ type Raft struct {
 	heartbeatCh chan struct{}
 	applyCh     chan raftapi.ApplyMsg
 
-	leaderSignal sync.Cond
+	asyncApplyCh chan raftapi.ApplyMsg
+
+	termToLastIndexMap map[int]int
 }
 
 type NodeState int
@@ -200,6 +202,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictTerm       int
+	ConflictFirstIndex int
 }
 
 // example RequestVote RPC handler.
@@ -256,16 +261,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
+	if args.Term < currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		Debug(dLog, "S%d rejected append entries from S%d: stale term %d < %d", rf.me, args.LeaderID, args.Term, currentTerm)
+		return
+	}
 	if args.Entry == EmptyLogEntry {
 		Debug(dLog, "S%d received heartbeat from S%d: term=%d, prevLogIndex=%d, prevLogTerm=%d, entry=[%d,%d]",
 			rf.me, args.LeaderID, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.Entry.Index, args.Entry.Term)
 		// It is an empty entry
 		// Leader is sending the heartbeat
-		if args.Term < currentTerm {
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			return
-		}
 		reply.Term = args.Term
 		if args.Term > currentTerm {
 			if rf.state == LEADER {
@@ -281,6 +287,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.PrevLogIndex >= len(rf.log) {
 			reply.Success = false
 			reply.Term = rf.currentTerm
+			reply.ConflictTerm = -1
+			reply.ConflictFirstIndex = len(rf.log)
 			Debug(dLog, "S%d rejected heartbeat: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
 			rf.AcceptHeartbeat()
 			return
@@ -288,6 +296,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// Check if term matches at prevLogIndex
 			reply.Success = false
 			reply.Term = rf.currentTerm
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			index := args.PrevLogIndex
+			for index > 0 && rf.log[index-1].Term == reply.ConflictTerm {
+				index -= 1
+			}
+			reply.ConflictFirstIndex = index
 			Debug(dLog, "S%d rejected heartbeat: term mismatch at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
 			rf.AcceptHeartbeat()
@@ -308,12 +322,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Reply false if term is stale
 		Debug(dLog, "S%d received append entries from S%d: term=%d, prevLogIndex=%d, prevLogTerm=%d, entry=[%d,%d]",
 			rf.me, args.LeaderID, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.Entry.Index, args.Entry.Term)
-		if args.Term < currentTerm {
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			Debug(dLog, "S%d rejected append entries from S%d: stale term %d < %d", rf.me, args.LeaderID, args.Term, currentTerm)
-			return
-		}
 		// Update term if newer
 		if args.Term > currentTerm {
 			rf.currentTerm = args.Term
@@ -330,6 +338,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.PrevLogIndex >= len(rf.log) {
 			reply.Success = false
 			reply.Term = rf.currentTerm
+			reply.ConflictTerm = -1
+			reply.ConflictFirstIndex = len(rf.log)
 			Debug(dLog, "S%d rejected append entries: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
 			rf.AcceptHeartbeat()
 			return
@@ -337,6 +347,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// Check if term matches at prevLogIndex
 			reply.Success = false
 			reply.Term = rf.currentTerm
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			index := args.PrevLogIndex
+			for index > 0 && rf.log[index-1].Term == reply.ConflictTerm {
+				index -= 1
+			}
+			reply.ConflictFirstIndex = index
 			Debug(dLog, "S%d rejected append entries: term mismatch at index %d, expected %d, got %d",
 				rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log[args.PrevLogIndex].Term)
 			rf.AcceptHeartbeat()
@@ -356,11 +372,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Debug(dLog2, "S%d found conflict at index %d, truncated log from %d to %d",
 					rf.me, args.Entry.Index, oldLen, len(rf.log))
 			} else if args.Entry.Index >= len(rf.log) {
-				oldLen := len(rf.log)
-				rf.log = rf.log[:args.Entry.Index]
-				rf.persist()
-				Debug(dLog2, "S%d found log longer after index %d, truncated log from %d to %d",
-					rf.me, args.Entry.Index, oldLen, len(rf.log))
+				if args.Entry.Index > len(rf.log) {
+					panic("aaa")
+				}
+				// oldLen := len(rf.log)
+				// rf.log = rf.log[:args.Entry.Index]
+				// rf.persist()
+				// Debug(dLog2, "S%d found log longer after index %d, truncated log from %d to %d",
+				// 	rf.me, args.Entry.Index, oldLen, len(rf.log))
+				// fmt.Println(dLog2, "S%d found log longer after index %d, truncated log from %d to %d",
+				// 	rf.me, args.Entry.Index, oldLen, len(rf.log))
 			}
 			// Append new entry
 			if args.Entry.Index == len(rf.log) {
@@ -412,7 +433,8 @@ func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs, newCommitIndex
 				Command:      entry.Command,
 				CommandIndex: rf.lastApplied,
 			}
-			rf.applyCh <- applyMsg
+			// rf.applyCh <- applyMsg
+			rf.asyncApplyCh <- applyMsg
 		}
 		Debug(dCommit, "S%d (follower) applied, index from %d to %d", rf.me, oldApplied, rf.lastApplied)
 	} else if args.LeaderCommit < rf.commitIndex {
@@ -488,6 +510,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		newEntry := LogEntry{term, index, command}
 		rf.log = append(rf.log, newEntry)
+		rf.termToLastIndexMap[term] = index
+		if newEntry.Index != index || newEntry.Index != rf.termToLastIndexMap[term] {
+			panic("bbb")
+		}
 		rf.persist()
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		index = len(rf.log) - 1
@@ -631,17 +657,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.heartbeatCh = make(chan struct{}, 1)
+	rf.asyncApplyCh = make(chan raftapi.ApplyMsg, 1000000)
 	rf.applyCh = applyCh
 
-	rf.leaderSignal = *sync.NewCond(&rf.mu)
-
+	rf.termToLastIndexMap = make(map[int]int)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
 	go rf.appendTicker()
-
+	go rf.ApplyRoutine()
 	return rf
 }
 
@@ -687,6 +713,10 @@ func (rf *Raft) CandidateSendRequestVote(currentTerm int, me int, lastLogIndex i
 				defer rf.mu.Unlock()
 				if currentTerm == rf.currentTerm {
 					rf.state = LEADER
+					rf.termToLastIndexMap = make(map[int]int)
+					for i := range rf.log {
+						rf.termToLastIndexMap[rf.log[i].Term] = rf.log[i].Index
+					}
 					Debug(dLeader, "S%d became leader for term %d with %d votes", rf.me, currentTerm, count)
 					for i := range rf.nextIndex {
 						rf.nextIndex[i] = len(rf.log)
@@ -761,15 +791,26 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 	}
 	if !reply.Success {
 		// 2. need to decrement nextIndex
-		rf.nextIndex[follower] -= 1
-		Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d via APE", rf.me, follower, rf.nextIndex[follower])
+		if reply.ConflictTerm == -1 {
+			rf.nextIndex[follower] = reply.ConflictFirstIndex
+			Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
+		} else {
+			lastIdx, ok := rf.termToLastIndexMap[reply.ConflictTerm]
+			if ok {
+				rf.nextIndex[follower] = lastIdx + 1
+				Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
+			} else {
+				rf.nextIndex[follower] = reply.ConflictFirstIndex
+				Debug(dLeader, "S%d (leader) decremented S%d nextIndex to %d ", rf.me, follower, rf.nextIndex[follower])
+			}
+		}
 		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
 		// This significantly reduces the number of RPC calls
 	} else {
 		// 3. successfully append entries
 		// Check if this is a duplicate reply by ensuring we haven't already processed this entry
 		if args.PrevLogIndex != rf.nextIndex[follower]-1 {
-			panic(fmt.Sprintf("111S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
+			panic(fmt.Sprintf("S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
 		}
 		if args.Entry != EmptyLogEntry && rf.nextIndex[follower] < len(rf.log) {
 			rf.matchIndex[follower] = rf.nextIndex[follower]
@@ -806,7 +847,8 @@ func (rf *Raft) LeaderCommit() {
 				Command:      rf.log[i].Command,
 				CommandIndex: i,
 			}
-			rf.applyCh <- msg
+			// rf.applyCh <- msg
+			rf.asyncApplyCh <- msg
 			rf.lastApplied = i
 		}
 		rf.commitIndex = newCommitIndex
@@ -819,5 +861,12 @@ func (rf *Raft) LeaderSwitchToFollower(term int) {
 		rf.state = FOLLOWER
 		rf.votedFor = -1
 		rf.persist()
+	}
+}
+
+func (rf *Raft) ApplyRoutine() {
+	for {
+		msg := <-rf.asyncApplyCh
+		rf.applyCh <- msg
 	}
 }
