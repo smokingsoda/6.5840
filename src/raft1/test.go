@@ -11,7 +11,7 @@ import (
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -139,6 +139,7 @@ func (ts *Test) checkLogs(i int, m raftapi.ApplyMsg) (string, bool) {
 	}
 	_, prevok := me.logs[m.CommandIndex-1]
 	me.logs[m.CommandIndex] = v
+	Debug(dWarn, "S%d add log, index=%d, entry=%v", i, m.CommandIndex, m.Command)
 	if m.CommandIndex > ts.maxIndex {
 		ts.maxIndex = m.CommandIndex
 	}

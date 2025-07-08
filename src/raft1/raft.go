@@ -158,6 +158,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = log
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.lastApplied = rf.lastIncludedIndex
 	}
 
 }
@@ -667,7 +669,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	Debug(dWarn, "S%d has been killed", rf.me)
-	close(rf.doneCh) // close
+	rf.doneCh <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
@@ -1032,7 +1034,7 @@ func (rf *Raft) LeaderCommit() {
 	if newCommitIndex > rf.commitIndex && newCommitIndex < len(rf.log)+rf.lastIncludedIndex && rf.log[newCommitIndex-rf.lastIncludedIndex].Term == rf.currentTerm {
 		oldCommitIndex := rf.commitIndex
 		Debug(dCommit, "S%d (leader) ready to commit, index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
-		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; rf.killed() == false && i <= newCommitIndex-rf.lastIncludedIndex; i++ {
+		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; i > 0 && rf.killed() == false && i <= newCommitIndex-rf.lastIncludedIndex; i++ {
 			msg := raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[i].Command,
