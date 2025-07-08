@@ -418,14 +418,14 @@ func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs, newCommitIndex
 	// VERRRRRRRRRRRRRRRYYYYYYYYYYYY IMPORTANT
 	// prevLogIndex & prevLogTerm check can guarantee the the follower's log before prevLogIndex
 	// is exactly the same as the leader, then we can update the commitIndex
-	if rf.killed() == false && args.LeaderCommit > rf.commitIndex {
+	if args.LeaderCommit > rf.commitIndex {
 		oldCommitIndex := rf.commitIndex
 		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 		rf.commitIndex = min(args.LeaderCommit, newCommitIndex)
 		Debug(dCommit, "S%d updated commitIndex from %d to %d (leaderCommit=%d)",
 			rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommit)
 		oldApplied := rf.lastApplied
-		for rf.lastApplied < rf.commitIndex {
+		for rf.killed() == false && rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			entry := rf.log[rf.lastApplied]
 			applyMsg := raftapi.ApplyMsg{
@@ -657,7 +657,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.heartbeatCh = make(chan struct{}, 1)
-	rf.asyncApplyCh = make(chan raftapi.ApplyMsg, 1000000)
+	rf.asyncApplyCh = make(chan raftapi.ApplyMsg, 100)
 	rf.applyCh = applyCh
 
 	rf.termToLastIndexMap = make(map[int]int)
@@ -841,7 +841,7 @@ func (rf *Raft) LeaderCommit() {
 	if newCommitIndex > rf.commitIndex && newCommitIndex < len(rf.log) && rf.log[newCommitIndex].Term == rf.currentTerm {
 		oldCommitIndex := rf.commitIndex
 		Debug(dCommit, "S%d (leader) ready to commit, index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
-		for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
+		for i := rf.commitIndex + 1; rf.killed() == false && i <= newCommitIndex; i++ {
 			msg := raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[i].Command,
@@ -865,7 +865,7 @@ func (rf *Raft) LeaderSwitchToFollower(term int) {
 }
 
 func (rf *Raft) ApplyRoutine() {
-	for {
+	for rf.killed() == false {
 		msg := <-rf.asyncApplyCh
 		rf.applyCh <- msg
 	}
