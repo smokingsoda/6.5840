@@ -60,6 +60,8 @@ type Raft struct {
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
+
+	doneCh chan struct{}
 }
 
 type NodeState int
@@ -156,8 +158,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = log
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
-		rf.lastApplied = lastIncludedIndex
-		rf.commitIndex = lastIncludedIndex
 	}
 
 }
@@ -666,6 +666,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	Debug(dWarn, "S%d has been killed", rf.me)
+	close(rf.doneCh) // close
 }
 
 func (rf *Raft) killed() bool {
@@ -805,6 +807,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
+
+	rf.doneCh = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -1052,8 +1056,14 @@ func (rf *Raft) LeaderSwitchToFollower(term int) {
 }
 
 func (rf *Raft) ApplyRoutine() {
-	for rf.killed() == false {
-		msg := <-rf.asyncApplyCh
-		rf.applyCh <- msg
+	for {
+		select {
+		case msg := <-rf.asyncApplyCh:
+			rf.applyCh <- msg
+			Debug(dCommit, "S%d asyn-applied, index=%d, entry=%v", rf.me, msg.CommandIndex, msg.Command)
+		case <-rf.doneCh:
+			// Lock-free solution, and guarantee the atomicity
+			return
+		}
 	}
 }
