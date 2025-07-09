@@ -66,7 +66,7 @@ type Raft struct {
 
 type NodeState int
 
-var EmptyLogEntry = LogEntry{Term: -1, Index: -1, Command: nil}
+var EmptyLogEntry = LogEntry{Term: -1, Index: -1, Command: -1}
 
 const (
 	LEADER NodeState = iota
