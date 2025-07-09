@@ -25,18 +25,20 @@ type rfsrv struct {
 	lastApplied int
 	persister   *tester.Persister
 
-	mu   sync.Mutex
-	raft raftapi.Raft
-	logs map[int]any // copy of each server's committed entries
+	mu         sync.Mutex
+	raft       raftapi.Raft
+	logs       map[int]any // copy of each server's committed entries
+	identifier int
 }
 
-func newRfsrv(ts *Test, srv int, ends []*labrpc.ClientEnd, persister *tester.Persister, snapshot bool) *rfsrv {
+func newRfsrv(ts *Test, srv int, ends []*labrpc.ClientEnd, persister *tester.Persister, snapshot bool, identifier int) *rfsrv {
 	//log.Printf("mksrv %d", srv)
 	s := &rfsrv{
-		ts:        ts,
-		me:        srv,
-		logs:      map[int]any{},
-		persister: persister,
+		ts:         ts,
+		me:         srv,
+		logs:       map[int]any{},
+		persister:  persister,
+		identifier: identifier,
 	}
 	applyCh := make(chan raftapi.ApplyMsg)
 	if !useRaftStateMachine {
@@ -53,9 +55,10 @@ func newRfsrv(ts *Test, srv int, ends []*labrpc.ClientEnd, persister *tester.Per
 				ts.t.Fatal(err)
 			}
 		}
-		go s.applierSnap(applyCh)
+		go s.applierSnap(applyCh, s.identifier)
 	} else {
-		go s.applier(applyCh)
+		Debug(dWarn, "S%d new rfsrv, idf=%d", s.me, s.identifier)
+		go s.applier(applyCh, s.identifier)
 	}
 	return s
 }
@@ -64,6 +67,7 @@ func (rs *rfsrv) Kill() {
 	//log.Printf("rs kill %d", rs.me)
 	rs.mu.Lock()
 	rs.raft = nil // tester will call Kill() on rs.raft
+	Debug(dWarn, "S%d set nil", rs.me)
 	rs.mu.Unlock()
 	if rs.persister != nil {
 		// mimic KV server that saves its persistent state in case it
@@ -77,9 +81,6 @@ func (rs *rfsrv) Kill() {
 func (rs *rfsrv) GetState() (int, bool) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	if rs.raft == nil {
-		return -1, false
-	}
 	return rs.raft.GetState()
 }
 
@@ -98,12 +99,12 @@ func (rs *rfsrv) Logs(i int) (any, bool) {
 
 // applier reads message from apply ch and checks that they match the log
 // contents
-func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
+func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg, identifier int) {
 	for m := range applyCh {
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
-			err_msg, prevok := rs.ts.checkLogs(rs.me, m)
+			err_msg, prevok := rs.ts.checkLogs(rs.me, m, identifier)
 			if m.CommandIndex > 1 && prevok == false {
 				err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)
 			}
@@ -119,11 +120,7 @@ func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
 }
 
 // periodically snapshot raft state
-func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
-	if rs.raft == nil {
-		return // ???
-	}
-
+func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg, identifier int) {
 	for m := range applyCh {
 		err_msg := ""
 		if m.SnapshotValid {
@@ -135,7 +132,7 @@ func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
 
 			if err_msg == "" {
 				var prevok bool
-				err_msg, prevok = rs.ts.checkLogs(rs.me, m)
+				err_msg, prevok = rs.ts.checkLogs(rs.me, m, identifier)
 				if m.CommandIndex > 1 && prevok == false {
 					err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)
 				}
@@ -154,9 +151,11 @@ func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
 				e.Encode(xlog)
 				start := tester.GetAnnotateTimestamp()
 				rs.mu.Lock()
-				if rs.raft != nil {
-					rs.raft.Snapshot(m.CommandIndex, w.Bytes())
+				if rs.raft == nil || rs.identifier != identifier {
+					rs.mu.Unlock()
+					return
 				}
+				rs.raft.Snapshot(m.CommandIndex, w.Bytes())
 				rs.mu.Unlock()
 				details := fmt.Sprintf(
 					"snapshot created after applying the command at index %v",
@@ -205,6 +204,8 @@ func (rs *rfsrv) ingestSnap(snapshot []byte, index int) string {
 	for j := 0; j < len(xlog); j++ {
 		rs.logs[j] = xlog[j]
 	}
+	old := rs.lastApplied
 	rs.lastApplied = lastIncludedIndex
+	Debug(dWarn, "S%d updated lastApplied from %d to %d", rs.me, old, lastIncludedIndex)
 	return ""
 }

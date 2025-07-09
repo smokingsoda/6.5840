@@ -197,6 +197,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.lastIncludedTerm = rf.log[0].Term
 		rf.persister.SetSnapshot(snapshot)
 		rf.persist()
+		rf.commitIndex = max(rf.lastIncludedIndex, rf.commitIndex)
+		rf.lastApplied = max(rf.lastIncludedIndex, rf.lastApplied)
+		// applyMsg := raftapi.ApplyMsg{
+		// 	CommandValid:  false,
+		// 	SnapshotValid: true,
+		// 	Snapshot:      rf.persister.ReadSnapshot(),
+		// 	SnapshotTerm:  rf.lastIncludedTerm,
+		// 	SnapshotIndex: rf.lastIncludedIndex,
+		// }
+		// rf.asyncApplyCh <- applyMsg
 		Debug(dSnap, "S%d created snapshot: index=%d, term=%d, log trimmed from %d to %d entries",
 			rf.me, index, rf.lastIncludedTerm, oldLen, len(rf.log))
 	}
@@ -510,7 +520,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 3. update the member vars
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
-	rf.lastApplied = rf.lastIncludedIndex
+	// DO NOT FORGET TO UPDATE THESE!
+	rf.commitIndex = max(rf.lastIncludedIndex, rf.commitIndex)
+	rf.lastApplied = max(rf.lastIncludedIndex, rf.lastApplied)
 	rf.persist()
 	applyMsg := raftapi.ApplyMsg{
 		CommandValid:  false,
@@ -668,8 +680,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	Debug(dWarn, "S%d has been killed", rf.me)
 	rf.doneCh <- struct{}{}
+	Debug(dWarn, "S%d has been killed", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -1034,7 +1046,10 @@ func (rf *Raft) LeaderCommit() {
 	if newCommitIndex > rf.commitIndex && newCommitIndex < len(rf.log)+rf.lastIncludedIndex && rf.log[newCommitIndex-rf.lastIncludedIndex].Term == rf.currentTerm {
 		oldCommitIndex := rf.commitIndex
 		Debug(dCommit, "S%d (leader) ready to commit, index from %d to %d", rf.me, oldCommitIndex, rf.commitIndex)
-		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; i > 0 && rf.killed() == false && i <= newCommitIndex-rf.lastIncludedIndex; i++ {
+		if rf.commitIndex+1-rf.lastIncludedIndex == 0 {
+			panic("wodiao")
+		}
+		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; rf.killed() == false && i <= newCommitIndex-rf.lastIncludedIndex; i++ {
 			msg := raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[i].Command,
@@ -1065,6 +1080,7 @@ func (rf *Raft) ApplyRoutine() {
 			Debug(dCommit, "S%d asyn-applied, index=%d, entry=%v", rf.me, msg.CommandIndex, msg.Command)
 		case <-rf.doneCh:
 			// Lock-free solution, and guarantee the atomicity
+			close(rf.applyCh)
 			return
 		}
 	}

@@ -26,6 +26,7 @@ type Test struct {
 	srvs     []*rfsrv
 	maxIndex int
 	snapshot bool
+	count    int
 }
 
 func makeTest(t *testing.T, n int, reliable bool, snapshot bool) *Test {
@@ -34,6 +35,7 @@ func makeTest(t *testing.T, n int, reliable bool, snapshot bool) *Test {
 		n:        n,
 		srvs:     make([]*rfsrv, n),
 		snapshot: snapshot,
+		count:    0,
 	}
 	ts.Config = tester.MakeConfig(t, n, reliable, ts.mksrv)
 	ts.Config.SetLongDelays(true)
@@ -49,9 +51,11 @@ func (ts *Test) cleanup() {
 }
 
 func (ts *Test) mksrv(ends []*labrpc.ClientEnd, grp tester.Tgid, srv int, persister *tester.Persister) []tester.IService {
-	s := newRfsrv(ts, srv, ends, persister, ts.snapshot)
 	ts.mu.Lock()
+	Debug(dWarn, "Test assigned idf=%d", ts.count)
+	s := newRfsrv(ts, srv, ends, persister, ts.snapshot, ts.count)
 	ts.srvs[srv] = s
+	ts.count += 1
 	ts.mu.Unlock()
 	return []tester.IService{s, s.raft}
 }
@@ -122,7 +126,7 @@ func (ts *Test) checkTerms() int {
 	return term
 }
 
-func (ts *Test) checkLogs(i int, m raftapi.ApplyMsg) (string, bool) {
+func (ts *Test) checkLogs(i int, m raftapi.ApplyMsg, identifier int) (string, bool) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
@@ -130,6 +134,14 @@ func (ts *Test) checkLogs(i int, m raftapi.ApplyMsg) (string, bool) {
 	v := m.Command
 	me := ts.srvs[i]
 	for j, rs := range ts.srvs {
+		if me.me == j {
+			if me.raft == nil || me.identifier != identifier {
+				// Updated, skip check
+				// Because the rfsrv and the logs(map) in it has been updated
+				// We can just think it's has been applied
+				return err_msg, true
+			}
+		}
 		if old, oldok := rs.Logs(m.CommandIndex); oldok && old != v {
 			//log.Printf("%v: log %v; server %v\n", i, me.logs, rs.logs)
 			// some server has already committed a different value for this entry!
