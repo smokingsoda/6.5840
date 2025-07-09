@@ -803,7 +803,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.dead = 0
 	rf.log = make([]LogEntry, 0) // log
-	rf.log = append(rf.log, LogEntry{0, 0, nil})
+	rf.log = append(rf.log, LogEntry{0, 0, 0})
 
 	// volatile state on all servers
 	rf.commitIndex = 0
