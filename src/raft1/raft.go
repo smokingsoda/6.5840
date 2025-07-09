@@ -948,7 +948,7 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 		return
 	}
 	// Handle For Snapshot
-	if rf.state != LEADER || goroutineTerm != rf.currentTerm || args.PrevLogIndex != rf.nextIndex[follower]-1 || args.PrevLogIndex-rf.lastIncludedIndex < 0 || args.PrevLogTerm != rf.log[args.PrevLogIndex-rf.lastIncludedIndex].Term {
+	if rf.killed() || rf.state != LEADER || goroutineTerm != rf.currentTerm || args.PrevLogIndex != rf.nextIndex[follower]-1 || args.PrevLogIndex-rf.lastIncludedIndex < 0 || args.PrevLogTerm != rf.log[args.PrevLogIndex-rf.lastIncludedIndex].Term {
 		// 1. Not leader anymore
 		// 2. goroutine out of date
 		// 3. nextIndex has been updated
@@ -980,7 +980,13 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 		if args.PrevLogIndex != rf.nextIndex[follower]-1 {
 			panic(fmt.Sprintf("S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
 		}
-		if args.Entries[0] != EmptyLogEntry && rf.nextIndex[follower] < len(rf.log)+rf.lastIncludedIndex {
+		if args.Entries[0] == EmptyLogEntry {
+			rf.matchIndex[follower] = args.PrevLogIndex
+			rf.nextIndex[follower] = rf.matchIndex[follower] + 1
+			if rf.nextIndex[follower]-rf.lastIncludedIndex > len(rf.log) {
+				panic("cuowu")
+			}
+		} else if args.Entries[0] != EmptyLogEntry && rf.nextIndex[follower] < len(rf.log)+rf.lastIncludedIndex {
 			rf.matchIndex[follower] = args.PrevLogIndex + len(args.Entries)
 			rf.nextIndex[follower] = rf.matchIndex[follower] + 1
 			Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
@@ -991,9 +997,7 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 				Debug(dLeader, "S%d (leader) S%d nextIndex %d reached log len %d", rf.me, follower, rf.nextIndex[follower], len(rf.log)+rf.lastIncludedIndex)
 			}
 		}
-		if args.Entries[0] != EmptyLogEntry {
-			rf.LeaderCommit()
-		}
+		rf.LeaderCommit()
 		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
 		// This significantly reduces the number of RPC calls
 		return

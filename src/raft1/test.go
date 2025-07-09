@@ -135,12 +135,15 @@ func (ts *Test) checkLogs(i int, m raftapi.ApplyMsg, identifier int) (string, bo
 	me := ts.srvs[i]
 	for j, rs := range ts.srvs {
 		if me.me == j {
+			me.mu.Lock()
 			if me.raft == nil || me.identifier != identifier {
+				me.mu.Unlock()
 				// Updated, skip check
 				// Because the rfsrv and the logs(map) in it has been updated
 				// We can just think it's has been applied
 				return err_msg, true
 			}
+			me.mu.Unlock()
 		}
 		if old, oldok := rs.Logs(m.CommandIndex); oldok && old != v {
 			//log.Printf("%v: log %v; server %v\n", i, me.logs, rs.logs)
