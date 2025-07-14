@@ -1,6 +1,7 @@
 package rsm
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -17,9 +18,9 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Me  int
-	Id  int
-	Req any
+	Me        int
+	TimeStamp int
+	Req       any
 }
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
@@ -42,7 +43,6 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	id      int
 	index   int
 	pending map[int]chan raftapi.ApplyMsg
 	term    int
@@ -69,7 +69,6 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
-		id:           0,
 		index:        1,
 		term:         0,
 		pending:      make(map[int]chan raftapi.ApplyMsg),
@@ -94,51 +93,39 @@ func (rsm *RSM) ApplyChReader() {
 	for {
 		msg, ok := <-rsm.applyCh
 		if !ok {
+			rsm.mu.Lock()
+			for timeStamp, ch := range rsm.pending {
+				close(ch)
+				delete(rsm.pending, timeStamp)
+			}
+			rsm.applyCh = nil
+			rsm.mu.Unlock()
 			return
 		}
 		if !msg.CommandValid {
 			continue
 		}
-		// log.Printf("S%d, receive msg index %d", rsm.me, msg.CommandIndex)
 		rsm.mu.Lock()
 		if msg.CommandIndex == rsm.index {
 			rsm.index = msg.CommandIndex + 1
-			// log.Printf("S%d, increment index to %d, value %v", rsm.me, rsm.index, msg.Command)
 		} else if msg.CommandIndex > rsm.index {
 			panic("ApplyChReader: impossible")
 		} else if msg.CommandIndex < rsm.index {
 			// duplicate apply, ignore
-			// log.Printf("S%d, reply %d", rsm.me, msg.CommandIndex)
 			rsm.mu.Unlock()
 			continue
 		}
 		op := msg.Command.(Op)
-		ch, exist := rsm.pending[op.Id]
+		ch, exist := rsm.pending[op.TimeStamp]
 		if exist && op.Me == rsm.me {
 			// leader, return by submit goroutine
-			delete(rsm.pending, op.Id)
+			delete(rsm.pending, op.TimeStamp)
 			rsm.mu.Unlock()
 			ch <- msg
 		} else {
 			// follower, return by this goroutine
-			// log.Printf("CCCS%d, submit, index %d, value %v", rsm.me, rsm.index-1, msg.Command)
 			rsm.sm.DoOp(op.Req)
 			rsm.mu.Unlock()
-		}
-	}
-}
-
-func (rsm *RSM) SubmitCleaner() {
-	term, _ := rsm.rf.GetState()
-	if term == rsm.term {
-		return
-	}
-	rsm.term = term
-	for id, ch := range rsm.pending {
-		if id < rsm.id {
-			delete(rsm.pending, id)
-			msg := raftapi.ApplyMsg{CommandValid: false}
-			ch <- msg
 		}
 	}
 }
@@ -151,66 +138,50 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
-
 	rsm.mu.Lock()
-	if rsm.rf == nil {
+	if rsm.rf == nil || rsm.applyCh == nil {
 		rsm.mu.Unlock()
-		// log.Printf("S%d, submit return A", rsm.me)
 		return rpc.ErrWrongLeader, nil
 	}
-	op := Op{rsm.me, rsm.id, req}
+	op := Op{rsm.me, int(time.Now().UnixNano()), req}
 	_, term, isLeader := rsm.rf.Start(op)
+	log.Printf("S%d, submit %d starts", rsm.me, op.TimeStamp)
+	defer log.Printf("S%d, submit %d done", rsm.me, op.TimeStamp)
 	if !isLeader {
-		// It is not the leader, we can't submit by this server
-		// log.Printf("S%d, not leader", rsm.me)
-		rsm.SubmitCleaner()
 		rsm.mu.Unlock()
-		// log.Printf("S%d, submit return B", rsm.me)
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
 	// Store the chan in the map
 	ch := make(chan raftapi.ApplyMsg)
-	// log.Printf("S%d, put id %d value %v", rsm.me, op.Id, op)
-	rsm.pending[op.Id] = ch
-	if rsm.term != term {
-		rsm.SubmitCleaner()
-	}
+	rsm.pending[op.TimeStamp] = ch
 	rsm.term = term
-	// Increment the id
-	rsm.id += 1
 	rsm.mu.Unlock()
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case msg := <-ch:
+		case msg, ok := <-ch:
+			if !ok {
+				return rpc.ErrWrongLeader, nil
+			}
 			if !msg.CommandValid {
-				// log.Printf("S%d, submit return C", rsm.me)
 				return rpc.ErrWrongLeader, nil
 			}
 			returnOp := msg.Command.(Op)
 			rsm.mu.Lock()
 			if op != returnOp {
-				// log.Printf("AAAS%d, submit, index %d, value %v", rsm.me, rsm.index-1, msg.Command)
-				// rsm.sm.DoOp(returnOp.Req)
-				// rsm.mu.Unlock()
 				panic("Submit: impossible")
-				// log.Printf("S%d, submit return D, origin: %v, now: %v", rsm.me, op, returnOp)
-				return rpc.ErrWrongLeader, nil
 			} else {
-				// log.Printf("BBBS%d, submit, index %d, value %v", rsm.me, rsm.index-1, msg.Command)
 				result := rsm.sm.DoOp(returnOp.Req)
 				rsm.mu.Unlock()
-				// log.Printf("S%d, submit return E", rsm.me)
 				return rpc.OK, result
 			}
 		case <-ticker.C:
 			rsm.mu.Lock()
 			term, _ = rsm.rf.GetState()
 			if rsm.term != term {
-				delete(rsm.pending, op.Id)
+				delete(rsm.pending, op.TimeStamp)
 				rsm.mu.Unlock()
-				// log.Printf("S%d, submit return F", rsm.me)
 				return rpc.ErrWrongLeader, nil
 			}
 			rsm.mu.Unlock()
