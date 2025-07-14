@@ -33,6 +33,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
 	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		reply := rpc.GetReply{}
 		ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
@@ -65,6 +66,7 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{}
 	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 	ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 	if ok {
 		return reply.Err

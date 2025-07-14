@@ -1,7 +1,6 @@
 package rsm
 
 import (
-	"log"
 	"sync"
 	"time"
 
@@ -145,8 +144,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	}
 	op := Op{rsm.me, int(time.Now().UnixNano()), req}
 	_, term, isLeader := rsm.rf.Start(op)
-	log.Printf("S%d, submit %d starts", rsm.me, op.TimeStamp)
-	defer log.Printf("S%d, submit %d done", rsm.me, op.TimeStamp)
 	if !isLeader {
 		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.

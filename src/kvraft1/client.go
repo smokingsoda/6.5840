@@ -1,11 +1,12 @@
 package kvraft
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"time"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt    *tester.Clnt
@@ -30,9 +31,20 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-
 	// You will have to modify this function.
-	return "", 0, ""
+	args := rpc.GetArgs{Key: key}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	i := 0
+	for {
+		reply := rpc.GetReply{}
+		ok := ck.clnt.Call(ck.servers[i], "KVServer.Get", &args, &reply)
+		if ok && reply.Err != rpc.ErrWrongLeader {
+			return reply.Value, reply.Version, reply.Err
+		}
+		<-ticker.C
+		i = (i + 1) % len(ck.servers)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -54,5 +66,26 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	reply := rpc.PutReply{}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	i := 0
+	ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
+	if ok && reply.Err != rpc.ErrWrongLeader {
+		return reply.Err
+	}
+	for {
+		i = (i + 1) % len(ck.servers)
+		ok = ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
+		if ok && reply.Err == rpc.OK {
+			// This resent args applies, reply OK
+			return reply.Err
+		}
+		if ok && reply.Err != rpc.ErrWrongLeader {
+			// Once it is wrong leader, whether what we sent before has definitely discrad due to raft
+			return rpc.ErrMaybe
+		}
+		<-ticker.C
+	}
 }
