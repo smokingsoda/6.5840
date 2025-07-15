@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"log"
+	"sync"
 	"sync/atomic"
 
 	"6.5840/kvraft1/rsm"
@@ -16,14 +18,24 @@ type KVServer struct {
 	rsm  *rsm.RSM
 
 	// Your definitions here.
-	// mu    sync.Mutex
+	mu    sync.Mutex
 	kvMap map[string]ValueVersionPair
+	locks map[string]*sync.Mutex
 }
 
 type ValueVersionPair struct {
 	Value   string
 	Version rpc.Tversion
 }
+
+// func (kv *KVServer) getLock(key string) *sync.Mutex {
+// 	kv.mu.Lock()
+// 	defer kv.mu.Unlock()
+// 	if _, exists := kv.locks[key]; !exists {
+// 		kv.locks[key] = &sync.Mutex{}
+// 	}
+// 	return kv.locks[key]
+// }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
 // assertions below:
@@ -32,44 +44,68 @@ type ValueVersionPair struct {
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
-	get, ok := req.(rpc.GetArgs)
-	if ok {
-		reply := rpc.GetReply{}
-		valueAndVersionPair, exists := kv.kvMap[get.Key]
-		if !exists {
-			reply.Err = rpc.ErrNoKey
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	switch r := req.(type) {
+	case rpc.GetArgs:
+		{
+			// log.Printf("S%d DoOp=%v", kv.me, r)
+			reply := rpc.GetReply{}
+			if kv.killed() {
+				reply.Err = rpc.ErrWrongLeader
+				return reply
+			}
+			// lock := kv.getLock(r.Key)
+			// lock.Lock()
+			// defer lock.Unlock()
+			valueAndVersionPair, exists := kv.kvMap[r.Key]
+			if !exists {
+				reply.Err = rpc.ErrNoKey
+				return reply
+			}
+			reply.Value = valueAndVersionPair.Value
+			reply.Version = valueAndVersionPair.Version
+			reply.Err = rpc.OK
 			return reply
 		}
-		reply.Value = valueAndVersionPair.Value
-		reply.Version = valueAndVersionPair.Version
-		reply.Err = rpc.OK
-		return reply
-	} else {
-		put, ok := req.(rpc.PutArgs)
-		if !ok {
-			panic("DoOp: Unexpected type")
-		}
-		reply := rpc.PutReply{}
-		old, exists := kv.kvMap[put.Key]
-		if !exists {
-			if put.Version != 0 {
-				reply.Err = rpc.ErrNoKey
-			} else {
-				kv.kvMap[put.Key] = ValueVersionPair{put.Value, put.Version + 1}
-				reply.Err = rpc.OK
+	case rpc.PutArgs:
+		{
+			// log.Printf("S%d DoOp=%v", kv.me, r)
+			reply := rpc.PutReply{}
+			if kv.killed() {
+				reply.Err = rpc.ErrWrongLeader
+				return reply
 			}
-		} else {
-			if put.Version != old.Version {
-				reply.Err = rpc.ErrVersion
+			// lock := kv.getLock(r.Key)
+			// lock.Lock()
+			// defer lock.Unlock()
+			old, exists := kv.kvMap[r.Key]
+			if !exists {
+				if r.Version != 0 {
+					reply.Err = rpc.ErrNoKey
+				} else {
+					kv.kvMap[r.Key] = ValueVersionPair{r.Value, r.Version + 1}
+					reply.Err = rpc.OK
+				}
 			} else {
-				old.Value = put.Value
-				old.Version = put.Version + 1
-				kv.kvMap[put.Key] = old
-				reply.Err = rpc.OK
+				if r.Version != old.Version {
+					reply.Err = rpc.ErrVersion
+				} else {
+					// old.Value = put.Value
+					// old.Version = put.Version + 1
+					kv.kvMap[r.Key] = ValueVersionPair{Value: r.Value, Version: r.Version + 1}
+					reply.Err = rpc.OK
+				}
 			}
+			return reply
 		}
-		return reply
+	default:
+		{
+			panic("DoOp: impossible")
+		}
 	}
+
 }
 
 func (kv *KVServer) Snapshot() []byte {
@@ -86,12 +122,20 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a GetReply: rep.(rpc.GetReply)
 	req := *args
+	// log.Printf("S%d SubmitReq=%v", kv.me, req)
 	err, result := kv.rsm.Submit(req)
 	if err == rpc.ErrWrongLeader {
 		reply.Err = rpc.ErrWrongLeader
 		return
 	}
-	*reply = result.(rpc.GetReply)
+	getReply, ok := result.(rpc.GetReply)
+	if !ok {
+		log.Printf("Get: actual type is %T", result)
+		panic("Get: impossible")
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+	*reply = getReply
 	return
 }
 
@@ -100,12 +144,20 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a PutReply: rep.(rpc.PutReply)
 	req := *args
+	// log.Printf("S%d SubmitReq=%v", kv.me, req)
 	err, result := kv.rsm.Submit(req)
 	if err == rpc.ErrWrongLeader {
 		reply.Err = rpc.ErrWrongLeader
 		return
 	}
-	*reply = result.(rpc.PutReply)
+	putReply, ok := result.(rpc.PutReply)
+	if !ok {
+		log.Printf("Put: actual type is %T", result)
+		panic("Put: impossible")
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
+	*reply = putReply
 	return
 }
 
@@ -119,6 +171,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
+	// log.Printf("S%d killed", kv.me)
 	// Your code here, if desired.
 }
 
@@ -140,6 +193,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	kv.kvMap = make(map[string]ValueVersionPair)
+	kv.locks = make(map[string]*sync.Mutex)
 	// You may need initialization code here.
+	// log.Printf("S%d made", kv.me)
 	return []tester.IService{kv, kv.rsm.Raft()}
 }

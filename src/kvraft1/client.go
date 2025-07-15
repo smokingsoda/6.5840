@@ -12,10 +12,11 @@ type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	// You will have to modify this struct.
+	leaderId int
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers}
+	ck := &Clerk{clnt: clnt, servers: servers, leaderId: 0}
 	// You'll have to add code here.
 	return ck
 }
@@ -34,11 +35,12 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
 	ms := 100
-	i := 0
+	i := ck.leaderId
 	for {
 		reply := rpc.GetReply{}
 		ok := ck.clnt.Call(ck.servers[i], "KVServer.Get", &args, &reply)
 		if ok && reply.Err != rpc.ErrWrongLeader {
+			ck.leaderId = i
 			return reply.Value, reply.Version, reply.Err
 		} else if ok && reply.Err == rpc.ErrWrongLeader {
 			i = (i + 1) % len(ck.servers)
@@ -72,43 +74,35 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	args := rpc.PutArgs{Key: key, Value: value, Version: version}
-	ms := 100
-	i := 0
+	putArgs := &rpc.PutArgs{Key: key, Value: value, Version: version}
+	firstAttempt := true
+	serverId := ck.leaderId
 	for {
-		reply := rpc.PutReply{}
-		ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
-		if ok && reply.Err != rpc.ErrWrongLeader {
-			return reply.Err
-		} else if ok && reply.Err == rpc.ErrWrongLeader {
-			i = (i + 1) % len(ck.servers)
-			continue
-		} else if !ok {
-			// Once the network fails, we can't make sure this op applies or not
-			break
-		} else {
-			panic("Put: unreachable 1")
+		for i := 0; i < len(ck.servers); i++ {
+			server := ck.servers[serverId]
+			var putReply rpc.PutReply
+			if ok := ck.clnt.Call(server, "KVServer.Put", putArgs, &putReply); ok {
+				if putReply.Err == rpc.OK {
+					ck.leaderId = serverId
+					return rpc.OK // 成功更新键值对
+				} else if putReply.Err == rpc.ErrNoKey {
+					ck.leaderId = serverId
+					return rpc.ErrNoKey // 键不存在
+				} else if putReply.Err == rpc.ErrVersion {
+					ck.leaderId = serverId
+					if firstAttempt {
+						return rpc.ErrVersion // 第一次尝试收到 ErrVersion，直接返回
+					} else {
+						return rpc.ErrMaybe // 重试阶段收到 ErrVersion，返回 ErrMaybe
+					}
+				} else if putReply.Err == rpc.ErrWrongLeader {
+					// 如果是 ErrWrongLeader，继续尝试下一个服务器
+				}
+			}
+			firstAttempt = false // 之后都是重试阶段
+			// 执行到这说明，RPC调用失败或者返回了 ErrWrongLeader
+			serverId = (serverId + 1) % len(ck.servers) // 循环尝试下一个服务器
 		}
-	}
-	i = (i + 1) % len(ck.servers)
-	for {
-		reply := rpc.PutReply{}
-		ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
-		if ok && reply.Err == rpc.OK {
-			// This resent args applies, reply OK
-			return reply.Err
-		} else if ok && reply.Err != rpc.ErrWrongLeader {
-			// Once it is the wrong leader, whether what we sent before has definitely discrad due to raft
-			return rpc.ErrMaybe
-		} else if ok && reply.Err == rpc.ErrWrongLeader {
-			i = (i + 1) % len(ck.servers)
-			continue
-		} else if !ok {
-			i = (i + 1) % len(ck.servers)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			continue
-		} else {
-			panic("Put: unreachable 2")
-		}
+		time.Sleep(500 * time.Millisecond) // 等待500ms再重试
 	}
 }

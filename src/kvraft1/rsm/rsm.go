@@ -42,9 +42,7 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	index   int
-	pending map[int]chan raftapi.ApplyMsg
-	term    int
+	pending map[int]chan any
 }
 
 // servers[] contains the ports of the set of
@@ -68,9 +66,9 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
-		index:        1,
-		term:         0,
-		pending:      make(map[int]chan raftapi.ApplyMsg),
+		// index:        1,
+		// term:         0,
+		pending: make(map[int]chan any),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -89,42 +87,48 @@ func (rsm *RSM) Raft() raftapi.Raft {
 }
 
 func (rsm *RSM) ApplyChReader() {
+	Debug(dApply, "S%d: ApplyChReader started", rsm.me)
 	for {
 		msg, ok := <-rsm.applyCh
 		if !ok {
+			Debug(dApply, "S%d: ApplyChReader channel closed, cleaning up pending requests", rsm.me)
 			rsm.mu.Lock()
-			for timeStamp, ch := range rsm.pending {
+			for _, ch := range rsm.pending {
 				close(ch)
-				delete(rsm.pending, timeStamp)
 			}
 			rsm.applyCh = nil
 			rsm.mu.Unlock()
+			Debug(dApply, "S%d: ApplyChReader exiting", rsm.me)
 			return
 		}
 		if !msg.CommandValid {
-			continue
-		}
-		rsm.mu.Lock()
-		if msg.CommandIndex == rsm.index {
-			rsm.index = msg.CommandIndex + 1
-		} else if msg.CommandIndex > rsm.index {
-			panic("ApplyChReader: impossible")
-		} else if msg.CommandIndex < rsm.index {
-			// duplicate apply, ignore
-			rsm.mu.Unlock()
+			Debug(dApply, "S%d: Received invalid command message, skipping", rsm.me)
 			continue
 		}
 		op := msg.Command.(Op)
+		Debug(dApply, "S%d: Applying op from S%d, timestamp=%d, req=%v", rsm.me, op.Me, op.TimeStamp, op.Req)
+
+		rsm.mu.Lock()
 		ch, exist := rsm.pending[op.TimeStamp]
+		if exist {
+			Debug(dPending, "S%d: Found pending request for timestamp=%d", rsm.me, op.TimeStamp)
+			delete(rsm.pending, op.TimeStamp)
+		} else {
+			Debug(dPending, "S%d: No pending request found for timestamp=%d", rsm.me, op.TimeStamp)
+		}
+		rsm.mu.Unlock()
+
 		if exist && op.Me == rsm.me {
 			// leader, return by submit goroutine
-			delete(rsm.pending, op.TimeStamp)
-			rsm.mu.Unlock()
-			ch <- msg
+			Debug(dApply, "S%d: Leader applying op, sending result to submit goroutine", rsm.me)
+			result := rsm.sm.DoOp(op.Req)
+			Debug(dState, "S%d: DoOp result=%v", rsm.me, result)
+			ch <- result
 		} else {
 			// follower, return by this goroutine
-			rsm.sm.DoOp(op.Req)
-			rsm.mu.Unlock()
+			Debug(dApply, "S%d: Follower applying op", rsm.me)
+			result := rsm.sm.DoOp(op.Req)
+			Debug(dState, "S%d: DoOp result=%v", rsm.me, result)
 		}
 	}
 }
@@ -133,51 +137,48 @@ func (rsm *RSM) ApplyChReader() {
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
+
+	// Make timestamp is unique
 	rsm.mu.Lock()
-	if rsm.rf == nil || rsm.applyCh == nil {
-		rsm.mu.Unlock()
-		return rpc.ErrWrongLeader, nil
-	}
 	op := Op{rsm.me, int(time.Now().UnixNano()), req}
-	_, term, isLeader := rsm.rf.Start(op)
+	// Store the chan in the map
+	ch := make(chan any, 1)
+	rsm.pending[op.TimeStamp] = ch
+	Debug(dSubmit, "S%d: Submitting op with timestamp=%d, req=%v", rsm.me, op.TimeStamp, req)
+	rsm.mu.Unlock()
+
+	_, originTerm, isLeader := rsm.rf.Start(op)
+	Debug(dSubmit, "S%d: Raft.Start returned term=%d, isLeader=%v", rsm.me, originTerm, isLeader)
+
 	if !isLeader {
+		Debug(dSubmit, "S%d: Not leader, cleaning up pending request", rsm.me)
+		rsm.mu.Lock()
+		delete(rsm.pending, op.TimeStamp)
+		Debug(dPending, "S%d: Pending map size after cleanup: %d", rsm.me, len(rsm.pending))
 		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
-	// Store the chan in the map
-	ch := make(chan raftapi.ApplyMsg)
-	rsm.pending[op.TimeStamp] = ch
-	rsm.term = term
-	rsm.mu.Unlock()
-	ticker := time.NewTicker(300 * time.Millisecond)
+
+	Debug(dSubmit, "S%d: Waiting for op to be applied, timestamp=%d", rsm.me, op.TimeStamp)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case msg, ok := <-ch:
+		case result, ok := <-ch:
 			if !ok {
+				Debug(dSubmit, "S%d: Channel closed, returning ErrWrongLeader", rsm.me)
 				return rpc.ErrWrongLeader, nil
 			}
-			if !msg.CommandValid {
-				return rpc.ErrWrongLeader, nil
-			}
-			returnOp := msg.Command.(Op)
-			rsm.mu.Lock()
-			if op != returnOp {
-				panic("Submit: impossible")
-			} else {
-				result := rsm.sm.DoOp(returnOp.Req)
-				rsm.mu.Unlock()
-				return rpc.OK, result
-			}
+			Debug(dSubmit, "S%d: Op applied successfully, returning result", rsm.me)
+			return rpc.OK, result
 		case <-ticker.C:
+			term, isLeader := rsm.rf.GetState()
 			rsm.mu.Lock()
-			term, _ = rsm.rf.GetState()
-			if rsm.term != term {
-				delete(rsm.pending, op.TimeStamp)
+			if originTerm != term || !isLeader || rsm.applyCh == nil {
+				Debug(dSubmit, "S%d: Leadership changed or channel closed, term=%d->%d, isLeader=%v", rsm.me, originTerm, term, isLeader)
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
