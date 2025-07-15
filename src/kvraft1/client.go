@@ -33,17 +33,23 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	ms := 100
 	i := 0
 	for {
 		reply := rpc.GetReply{}
 		ok := ck.clnt.Call(ck.servers[i], "KVServer.Get", &args, &reply)
 		if ok && reply.Err != rpc.ErrWrongLeader {
 			return reply.Value, reply.Version, reply.Err
+		} else if ok && reply.Err == rpc.ErrWrongLeader {
+			i = (i + 1) % len(ck.servers)
+			continue
+		} else if !ok {
+			i = (i + 1) % len(ck.servers)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			continue
+		} else {
+			panic("Get: unreachable")
 		}
-		<-ticker.C
-		i = (i + 1) % len(ck.servers)
 	}
 }
 
@@ -67,25 +73,42 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
-	reply := rpc.PutReply{}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	ms := 100
 	i := 0
-	ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
-	if ok && reply.Err != rpc.ErrWrongLeader {
-		return reply.Err
-	}
 	for {
-		i = (i + 1) % len(ck.servers)
-		ok = ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
+		reply := rpc.PutReply{}
+		ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
+		if ok && reply.Err != rpc.ErrWrongLeader {
+			return reply.Err
+		} else if ok && reply.Err == rpc.ErrWrongLeader {
+			i = (i + 1) % len(ck.servers)
+			continue
+		} else if !ok {
+			// Once the network fails, we can't make sure this op applies or not
+			break
+		} else {
+			panic("Put: unreachable 1")
+		}
+	}
+	i = (i + 1) % len(ck.servers)
+	for {
+		reply := rpc.PutReply{}
+		ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
 		if ok && reply.Err == rpc.OK {
 			// This resent args applies, reply OK
 			return reply.Err
-		}
-		if ok && reply.Err != rpc.ErrWrongLeader {
-			// Once it is wrong leader, whether what we sent before has definitely discrad due to raft
+		} else if ok && reply.Err != rpc.ErrWrongLeader {
+			// Once it is the wrong leader, whether what we sent before has definitely discrad due to raft
 			return rpc.ErrMaybe
+		} else if ok && reply.Err == rpc.ErrWrongLeader {
+			i = (i + 1) % len(ck.servers)
+			continue
+		} else if !ok {
+			i = (i + 1) % len(ck.servers)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			continue
+		} else {
+			panic("Put: unreachable 2")
 		}
-		<-ticker.C
 	}
 }
