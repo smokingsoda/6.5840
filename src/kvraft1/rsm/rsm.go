@@ -1,6 +1,7 @@
 package rsm
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -79,6 +80,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		panic("useRaftStateMachine is true, but no alternative raft implementation is provided")
 	}
 	go rsm.ApplyChReader()
+	log.Printf("S%d made", rsm.me)
 	return rsm
 }
 
@@ -96,6 +98,7 @@ func (rsm *RSM) ApplyChReader() {
 				close(op.Ch)
 			}
 			rsm.applyCh = nil
+			log.Printf("S%d applyCh killed", rsm.me)
 			rsm.pending = make(map[int]*Op)
 			rsm.mu.Unlock()
 			return
@@ -103,30 +106,17 @@ func (rsm *RSM) ApplyChReader() {
 		if !msg.CommandValid {
 			continue
 		}
-
 		req := msg.Command
-
 		// DoOp first
 		result := rsm.sm.DoOp(req)
 		// Need to check if raft still in the term and leader state when command submited
-		term, isLeader := rsm.rf.GetState()
-
 		rsm.mu.Lock()
 		op, exist := rsm.pending[msg.CommandIndex]
-		if exist && term == op.Term && isLeader {
+		if exist {
 			// The command was executed in the same term *and* we're still leader –
 			// deliver the result back to the original caller.
 			delete(rsm.pending, msg.CommandIndex)
 			op.Ch <- result
-		} else if exist {
-			// Raft term or leadership has changed since the command was submitted.
-			// All outstanding requests that were waiting for the old term/leader
-			// must be failed so their Submit() invocations can return and the
-			// goroutines can exit.  Close every pending channel and reset the map.
-			for idx, p := range rsm.pending {
-				close(p.Ch)
-				delete(rsm.pending, idx)
-			}
 		}
 		rsm.mu.Unlock()
 	}
@@ -139,11 +129,14 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
-
-	originIndex, originTerm, isLeader := rsm.rf.Start(req)
-	if !isLeader {
+	if rsm.rf == nil {
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
+	originIndex, originTerm, isLeader := rsm.rf.Start(req)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+
 	// Make timestamp is unique
 	rsm.mu.Lock()
 	// Store the chan in the map
@@ -153,32 +146,43 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	}
 	ch := make(chan any, 1)
 	op := Op{Me: rsm.me, Index: originIndex, Term: originTerm, Req: req, Ch: ch}
+	if oldOp, exist := rsm.pending[originIndex]; exist {
+		delete(rsm.pending, originIndex)
+		close(oldOp.Ch)
+	}
 	rsm.pending[originIndex] = &op
 	rsm.mu.Unlock()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	// Wait for the command to either be applied (ApplyChReader will send the
+	// result on ch) *or* for this server to step down as leader (term change
+	// or leadership lost). Use a small ticker to periodically re-check the
+	// leadership state so that Submit eventually returns instead of blocking
+	// forever when the server loses leadership without the command being
+	// committed (e.g., in a minority partition).
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case result, ok := <-ch:
-			// close by ApplyChReader
-			if !ok {
+			// ApplyChReader delivered a result or the channel has been closed.
+			currentTerm, currentIsLeader := rsm.rf.GetState()
+			if !ok || !currentIsLeader || currentTerm != originTerm {
 				return rpc.ErrWrongLeader, nil
 			}
 			return rpc.OK, result
+
 		case <-ticker.C:
-			// check regularly, and this index is useless, maybe rewritten by other submut goroutine
-			// should not delete in this goroutine
-			term, isLeader := rsm.rf.GetState()
-			rsm.mu.Lock()
-			if originTerm != term || !isLeader || rsm.applyCh == nil {
-				if op.Index != originIndex {
-					panic("Submit: impossible")
+			currentTerm, currentIsLeader := rsm.rf.GetState()
+			if !currentIsLeader || currentTerm != originTerm {
+				// No longer leader – clean up and tell caller to retry.
+				rsm.mu.Lock()
+				if opCur, exist := rsm.pending[originIndex]; exist && opCur.Ch == ch {
+					delete(rsm.pending, originIndex)
+					close(ch)
 				}
-				delete(rsm.pending, op.Index)
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
-			rsm.mu.Unlock()
 		}
 	}
 }
