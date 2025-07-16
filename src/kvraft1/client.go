@@ -90,8 +90,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			ck.leaderId = i
 			return rpc.ErrNoKey
 		} else if ok && reply.Err == rpc.ErrWrongLeader {
-			i = (i + 1) % len(ck.servers)
-			continue
+			break
 		} else if !ok {
 			// Once the network fails, we can't make sure this op applies or not
 			break
