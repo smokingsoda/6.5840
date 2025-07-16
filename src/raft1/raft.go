@@ -10,7 +10,6 @@ import (
 	//	"bytes"
 	"bytes"
 	"fmt"
-	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -707,9 +706,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	log.Printf("S%d want to kill", rf.me)
 	rf.doneCh <- struct{}{}
-	log.Printf("S%d killed", rf.me)
 	Debug(dWarn, "S%d has been killed", rf.me)
 }
 
