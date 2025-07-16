@@ -34,7 +34,7 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
-	ms := 100
+	ms := 50
 	i := ck.leaderId
 	for {
 		reply := rpc.GetReply{}
@@ -75,7 +75,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
-	ms := 500
+	ms := 50
 	i := ck.leaderId
 	for {
 		reply := rpc.PutReply{}
@@ -90,6 +90,8 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			ck.leaderId = i
 			return rpc.ErrNoKey
 		} else if ok && reply.Err == rpc.ErrWrongLeader {
+			// Wrong Leader should break too
+			// Because what if the leader first appended successfully but lost leader state?
 			break
 		} else if !ok {
 			// Once the network fails, we can't make sure this op applies or not

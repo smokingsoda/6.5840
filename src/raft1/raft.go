@@ -10,6 +10,7 @@ import (
 	//	"bytes"
 	"bytes"
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -64,6 +65,24 @@ type Raft struct {
 	doneCh chan struct{}
 }
 
+// safeAsyncSend tries to send an ApplyMsg to rf.asyncApplyCh. If the Raft
+// instance has been killed (Kill called and doneCh closed), it aborts early
+// so that callers will not be blocked forever. The boolean return value
+// indicates whether the message was actually delivered.
+func (rf *Raft) safeAsyncSend(msg raftapi.ApplyMsg) bool {
+	for !rf.killed() {
+		select {
+		case rf.asyncApplyCh <- msg:
+			return true
+		default:
+			// asyncApplyCh is full – yield the processor briefly so that the
+			// ApplyRoutine can make progress, then retry or detect kill.
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+	return false
+}
+
 type NodeState int
 
 var EmptyLogEntry = LogEntry{Term: -1, Index: -1, Command: -1}
@@ -83,6 +102,9 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	if rf.killed() {
+		return -1, false
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	var term int
@@ -531,8 +553,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  rf.lastIncludedTerm,
 		SnapshotIndex: rf.lastIncludedIndex,
 	}
-	if rf.killed() == false {
-		rf.asyncApplyCh <- applyMsg
+	if !rf.safeAsyncSend(applyMsg) {
+		return
 	}
 	rf.AcceptHeartbeat()
 }
@@ -557,7 +579,10 @@ func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs, newCommitIndex
 		if rf.lastApplied < rf.lastIncludedIndex {
 			rf.lastApplied = rf.lastIncludedIndex
 		}
-		for rf.killed() == false && rf.lastApplied < rf.commitIndex {
+		for rf.lastApplied < rf.commitIndex {
+			if rf.killed() {
+				return
+			}
 			rf.lastApplied++
 			entry := rf.log[rf.lastApplied-rf.lastIncludedIndex]
 			applyMsg := raftapi.ApplyMsg{
@@ -569,7 +594,9 @@ func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs, newCommitIndex
 				panic("caonimade")
 			}
 			Debug(dCommit, "S%d (follower) applied, index=%d, entry=%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
-			rf.asyncApplyCh <- applyMsg
+			if !rf.safeAsyncSend(applyMsg) {
+				return
+			}
 		}
 	} else if args.LeaderCommit < rf.commitIndex {
 		// Do nothing, because it is out-of-date RPC
@@ -680,7 +707,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	log.Printf("S%d want to kill", rf.me)
 	rf.doneCh <- struct{}{}
+	log.Printf("S%d killed", rf.me)
 	Debug(dWarn, "S%d has been killed", rf.me)
 }
 
@@ -733,7 +762,7 @@ func (rf *Raft) electionTicker() {
 func (rf *Raft) appendTicker() {
 	for rf.killed() == false {
 		// Debug info when ticker wakes up
-		ms := 50
+		ms := 30
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
 		state := rf.state
@@ -1053,14 +1082,19 @@ func (rf *Raft) LeaderCommit() {
 		if rf.commitIndex+1-rf.lastIncludedIndex == 0 {
 			panic("wodiao")
 		}
-		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; rf.killed() == false && i <= newCommitIndex-rf.lastIncludedIndex; i++ {
+		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; i <= newCommitIndex-rf.lastIncludedIndex; i++ {
+			if rf.killed() {
+				return
+			}
 			msg := raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[i].Command,
 				CommandIndex: i + rf.lastIncludedIndex,
 			}
 			Debug(dCommit, "S%d (leader) applied, index=%d, entry=%v", rf.me, msg.CommandIndex, msg.Command)
-			rf.asyncApplyCh <- msg
+			if !rf.safeAsyncSend(msg) {
+				return
+			}
 			rf.lastApplied = i + rf.lastIncludedIndex
 		}
 		rf.commitIndex = newCommitIndex
