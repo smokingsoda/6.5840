@@ -74,35 +74,51 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	putArgs := &rpc.PutArgs{Key: key, Value: value, Version: version}
-	firstAttempt := true
-	serverId := ck.leaderId
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	ms := 500
+	i := ck.leaderId
 	for {
-		for i := 0; i < len(ck.servers); i++ {
-			server := ck.servers[serverId]
-			var putReply rpc.PutReply
-			if ok := ck.clnt.Call(server, "KVServer.Put", putArgs, &putReply); ok {
-				if putReply.Err == rpc.OK {
-					ck.leaderId = serverId
-					return rpc.OK // 成功更新键值对
-				} else if putReply.Err == rpc.ErrNoKey {
-					ck.leaderId = serverId
-					return rpc.ErrNoKey // 键不存在
-				} else if putReply.Err == rpc.ErrVersion {
-					ck.leaderId = serverId
-					if firstAttempt {
-						return rpc.ErrVersion // 第一次尝试收到 ErrVersion，直接返回
-					} else {
-						return rpc.ErrMaybe // 重试阶段收到 ErrVersion，返回 ErrMaybe
-					}
-				} else if putReply.Err == rpc.ErrWrongLeader {
-					// 如果是 ErrWrongLeader，继续尝试下一个服务器
-				}
-			}
-			firstAttempt = false // 之后都是重试阶段
-			// 执行到这说明，RPC调用失败或者返回了 ErrWrongLeader
-			serverId = (serverId + 1) % len(ck.servers) // 循环尝试下一个服务器
+		reply := rpc.PutReply{}
+		ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
+		if ok && reply.Err == rpc.OK {
+			ck.leaderId = i
+			return rpc.OK
+		} else if ok && reply.Err == rpc.ErrVersion {
+			ck.leaderId = i
+			return rpc.ErrVersion
+		} else if ok && reply.Err == rpc.ErrNoKey {
+			ck.leaderId = i
+			return rpc.ErrNoKey
+		} else if ok && reply.Err == rpc.ErrWrongLeader {
+			i = (i + 1) % len(ck.servers)
+			continue
+		} else if !ok {
+			// Once the network fails, we can't make sure this op applies or not
+			break
+		} else {
+			panic("Put: unreachable 1")
 		}
-		time.Sleep(500 * time.Millisecond) // 等待500ms再重试
+	}
+	i = (i + 1) % len(ck.servers)
+	for {
+		reply := rpc.PutReply{}
+		ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
+		if ok && reply.Err == rpc.OK {
+			// This resent args applies, reply OK
+			ck.leaderId = i
+			return rpc.OK
+		} else if ok && reply.Err == rpc.ErrVersion {
+			ck.leaderId = i
+			return rpc.ErrMaybe
+		} else if ok && reply.Err == rpc.ErrNoKey {
+			ck.leaderId = i
+			return rpc.ErrNoKey
+		} else if ok && reply.Err == rpc.ErrWrongLeader {
+		} else if !ok {
+		} else {
+			panic("Put: unreachable 2")
+		}
+		i = (i + 1) % len(ck.servers)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
