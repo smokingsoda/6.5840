@@ -208,13 +208,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 		// --------- 新增：维护 termToLastIndexMap ----------
 		// ① 删除所有已经被快照丢弃的 term→index
-		for term, idx := range rf.termToLastIndexMap {
-			if idx < rf.lastIncludedIndex { // 被截掉
-				delete(rf.termToLastIndexMap, term)
-			}
+		rf.termToLastIndexMap = make(map[int]int)
+		for i := range rf.log {
+			rf.termToLastIndexMap[rf.log[i].Term] = rf.log[i].Index
 		}
-		// ② 把快照基准条目的 term→index 放回去，供冲突回退用
-		rf.termToLastIndexMap[rf.log[0].Term] = rf.log[0].Index
 		// ---------------------------------------------------
 
 		// 把快照写入持久化存储
@@ -483,6 +480,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.persist()
 				Debug(dLog2, "S%d appended entry at index %d, term %d, log length now %d",
 					rf.me, args.Entries[0].Index, args.Entries[0].Term, len(rf.log))
+				if rf.log[len(rf.log)-1].Index != len(rf.log)-1+rf.lastIncludedIndex {
+					panic("AppendEntries: impossible")
+				}
 				newCommitIndex := min(args.LeaderCommit, len(rf.log)-1+rf.lastIncludedIndex)
 				rf.FollowerUpdateCommitIndex(*args, newCommitIndex)
 			}
@@ -683,6 +683,7 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.applyCond.Signal()
 	// Your code here, if desired.
 	Debug(dWarn, "S%d has been killed", rf.me)
 }
@@ -1094,6 +1095,7 @@ func (rf *Raft) applyDaemon() {
 			rf.applyCond.Wait()
 		}
 		if rf.killed() {
+			close(rf.applyCh)
 			return
 		}
 		// apply snapshot first
@@ -1102,12 +1104,13 @@ func (rf *Raft) applyDaemon() {
 			rf.pendingSnapshot = nil
 			rf.mu.Unlock()
 			rf.applyCh <- msg
+			Debug(dCommit, "S%d applied a snapshot, index=", rf.me, msg.SnapshotIndex)
 			rf.mu.Lock()
 			continue
 		}
-
 		start := rf.lastApplied + 1
 		end := rf.commitIndex
+		Debug(dCommit, "S%d ready to apply, start=%d, end=%d", rf.me, start, end)
 		msgs := make([]raftapi.ApplyMsg, 0, end-start+1)
 		for i := start; i <= end; i++ {
 			entry := rf.log[i-rf.lastIncludedIndex]
@@ -1123,5 +1126,6 @@ func (rf *Raft) applyDaemon() {
 			rf.applyCh <- m
 		}
 		rf.mu.Lock()
+		Debug(dCommit, "S%d applied, start=%d, end=%d", rf.me, start, end)
 	}
 }
