@@ -155,6 +155,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		Debug(dPersist, "S%d decode persisted state", rf.me)
+		// ----------- 恢复持久化字段 -----------
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
@@ -162,8 +163,13 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.commitIndex = rf.lastIncludedIndex
 		rf.lastApplied = rf.lastIncludedIndex
-	}
 
+		// ----------- 重新构建 term→lastIndex 映射 -----------
+		rf.termToLastIndexMap = make(map[int]int)
+		for i := range rf.log {
+			rf.termToLastIndexMap[rf.log[i].Term] = rf.log[i].Index
+		}
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -190,6 +196,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			rf.me, index)
 		return
 	} else {
+		// 1. truncate the log
 		oldLen := len(rf.log)
 		rf.log = rf.log[index-rf.log[0].Index:]
 		rf.lastIncludedIndex = index
@@ -197,10 +204,25 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			panic("wrong!")
 		}
 		rf.lastIncludedTerm = rf.log[0].Term
+		// ... persist & 更新 commitIndex/lastApplied ...
+
+		// --------- 新增：维护 termToLastIndexMap ----------
+		// ① 删除所有已经被快照丢弃的 term→index
+		for term, idx := range rf.termToLastIndexMap {
+			if idx < rf.lastIncludedIndex { // 被截掉
+				delete(rf.termToLastIndexMap, term)
+			}
+		}
+		// ② 把快照基准条目的 term→index 放回去，供冲突回退用
+		rf.termToLastIndexMap[rf.log[0].Term] = rf.log[0].Index
+		// ---------------------------------------------------
+
+		// 把快照写入持久化存储
 		rf.persister.SetSnapshot(snapshot)
 		rf.persist()
 		rf.commitIndex = max(rf.lastIncludedIndex, rf.commitIndex)
 		rf.lastApplied = max(rf.lastIncludedIndex, rf.lastApplied)
+		rf.applyCond.Signal()
 		Debug(dSnap, "S%d created snapshot: index=%d, term=%d, log trimmed from %d to %d entries",
 			rf.me, index, rf.lastIncludedTerm, oldLen, len(rf.log))
 	}
