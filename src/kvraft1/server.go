@@ -28,15 +28,6 @@ type ValueVersionPair struct {
 	Version rpc.Tversion
 }
 
-// func (kv *KVServer) getLock(key string) *sync.Mutex {
-// 	kv.mu.Lock()
-// 	defer kv.mu.Unlock()
-// 	if _, exists := kv.locks[key]; !exists {
-// 		kv.locks[key] = &sync.Mutex{}
-// 	}
-// 	return kv.locks[key]
-// }
-
 // To type-cast req to the right type, take a look at Go's type switches or type
 // assertions below:
 //
@@ -44,8 +35,6 @@ type ValueVersionPair struct {
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	switch r := req.(type) {
 	case rpc.GetArgs:
@@ -77,9 +66,6 @@ func (kv *KVServer) DoOp(req any) any {
 				reply.Err = rpc.ErrWrongLeader
 				return reply
 			}
-			// lock := kv.getLock(r.Key)
-			// lock.Lock()
-			// defer lock.Unlock()
 			old, exists := kv.kvMap[r.Key]
 			if !exists {
 				if r.Version != 0 {
@@ -92,8 +78,6 @@ func (kv *KVServer) DoOp(req any) any {
 				if r.Version != old.Version {
 					reply.Err = rpc.ErrVersion
 				} else {
-					// old.Value = put.Value
-					// old.Version = put.Version + 1
 					kv.kvMap[r.Key] = ValueVersionPair{Value: r.Value, Version: r.Version + 1}
 					reply.Err = rpc.OK
 				}
@@ -122,7 +106,6 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a GetReply: rep.(rpc.GetReply)
 	req := *args
-	// log.Printf("S%d SubmitReq=%v", kv.me, req)
 	err, result := kv.rsm.Submit(req)
 	if err == rpc.ErrWrongLeader {
 		reply.Err = rpc.ErrWrongLeader
@@ -144,7 +127,6 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a PutReply: rep.(rpc.PutReply)
 	req := *args
-	// log.Printf("S%d SubmitReq=%v", kv.me, req)
 	err, result := kv.rsm.Submit(req)
 	if err == rpc.ErrWrongLeader {
 		reply.Err = rpc.ErrWrongLeader
@@ -171,7 +153,6 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
-	// log.Printf("S%d killed", kv.me)
 	// Your code here, if desired.
 }
 
@@ -195,6 +176,5 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	kv.kvMap = make(map[string]ValueVersionPair)
 	kv.locks = make(map[string]*sync.Mutex)
 	// You may need initialization code here.
-	// log.Printf("S%d made", kv.me)
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
