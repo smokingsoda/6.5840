@@ -195,8 +195,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 
 	kv := &KVServer{me: me}
 
-	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	kv.kvMap = make(map[string]ValueVersionPair)
+
+	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
 	return []tester.IService{kv, kv.rsm.Raft()}
 }

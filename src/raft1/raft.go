@@ -155,7 +155,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		Debug(dPersist, "S%d decode persisted state", rf.me)
-		// ----------- 恢复持久化字段 -----------
+
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
@@ -163,12 +163,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.commitIndex = rf.lastIncludedIndex
 		rf.lastApplied = rf.lastIncludedIndex
-
-		// ----------- 重新构建 term→lastIndex 映射 -----------
-		rf.termToLastIndexMap = make(map[int]int)
-		for i := range rf.log {
-			rf.termToLastIndexMap[rf.log[i].Term] = rf.log[i].Index
-		}
 	}
 }
 
@@ -204,17 +198,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			panic("wrong!")
 		}
 		rf.lastIncludedTerm = rf.log[0].Term
-		// ... persist & 更新 commitIndex/lastApplied ...
-
-		// --------- 新增：维护 termToLastIndexMap ----------
-		// ① 删除所有已经被快照丢弃的 term→index
-		rf.termToLastIndexMap = make(map[int]int)
-		for i := range rf.log {
-			rf.termToLastIndexMap[rf.log[i].Term] = rf.log[i].Index
-		}
-		// ---------------------------------------------------
-
-		// 把快照写入持久化存储
 		rf.persister.SetSnapshot(snapshot)
 		rf.persist()
 		rf.commitIndex = max(rf.lastIncludedIndex, rf.commitIndex)
@@ -737,7 +720,7 @@ func (rf *Raft) electionTicker() {
 func (rf *Raft) appendTicker() {
 	for rf.killed() == false {
 		// Debug info when ticker wakes up
-		ms := 30
+		ms := 50
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
 		state := rf.state
@@ -1112,20 +1095,20 @@ func (rf *Raft) applyDaemon() {
 		end := rf.commitIndex
 		Debug(dCommit, "S%d ready to apply, start=%d, end=%d", rf.me, start, end)
 		msgs := make([]raftapi.ApplyMsg, 0, end-start+1)
-		for i := start; i <= end; i++ {
+		for i := start; i <= end && i-rf.lastIncludedIndex < len(rf.log); i++ {
 			entry := rf.log[i-rf.lastIncludedIndex]
 			msgs = append(msgs, raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: i,
 			})
+			rf.lastApplied = i
 		}
-		rf.lastApplied = end
 		rf.mu.Unlock()
 		for _, m := range msgs {
 			rf.applyCh <- m
 		}
 		rf.mu.Lock()
-		Debug(dCommit, "S%d applied, start=%d, end=%d", rf.me, start, end)
+		Debug(dCommit, "S%d applied, start=%d, end=%d, lastApplied=%d", rf.me, start, end, rf.lastApplied)
 	}
 }

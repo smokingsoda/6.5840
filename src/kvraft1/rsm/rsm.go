@@ -46,6 +46,7 @@ type RSM struct {
 	// Your definitions here.
 	pending          map[int]*Op
 	lastAppliedIndex int
+	count            int
 }
 
 // servers[] contains the ports of the set of
@@ -71,6 +72,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:               sm,
 		pending:          make(map[int]*Op),
 		lastAppliedIndex: 0,
+		count:            0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -150,18 +152,21 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	if rsm.rf == nil {
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
-	originIndex, originTerm, isLeader := rsm.rf.Start(req)
-	if !isLeader {
-		return rpc.ErrWrongLeader, nil
-	}
 
-	// Make timestamp is unique
 	rsm.mu.Lock()
 	// Store the chan in the map
 	if rsm.applyCh == nil {
 		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
+
+	originIndex, originTerm, isLeader := rsm.rf.Start(req)
+
+	if !isLeader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
 	ch := make(chan any, 1)
 	op := Op{Me: rsm.me, Index: originIndex, Term: originTerm, Req: req, Ch: ch}
 	if oldOp, exist := rsm.pending[originIndex]; exist {
@@ -178,13 +183,15 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// committed (e.g., in a minority partition).
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case result, ok := <-ch:
 			// ApplyChReader delivered a result or the channel has been closed.
+			if !ok {
+				return rpc.ErrWrongLeader, nil
+			}
 			currentTerm, currentIsLeader := rsm.rf.GetState()
-			if !ok || !currentIsLeader || currentTerm != originTerm {
+			if !currentIsLeader || currentTerm != originTerm {
 				return rpc.ErrWrongLeader, nil
 			}
 			return rpc.OK, result
@@ -201,6 +208,12 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
+			rsm.mu.Lock()
+			if rsm.applyCh == nil {
+				rsm.mu.Unlock()
+				return rpc.ErrWrongLeader, nil
+			}
+			rsm.mu.Unlock()
 		}
 	}
 }
