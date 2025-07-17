@@ -54,32 +54,13 @@ type Raft struct {
 	heartbeatCh chan struct{}
 	applyCh     chan raftapi.ApplyMsg
 
-	asyncApplyCh chan raftapi.ApplyMsg
+	applyCond       *sync.Cond
+	pendingSnapshot *raftapi.ApplyMsg
 
 	termToLastIndexMap map[int]int
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
-
-	doneCh chan struct{}
-}
-
-// safeAsyncSend tries to send an ApplyMsg to rf.asyncApplyCh. If the Raft
-// instance has been killed (Kill called and doneCh closed), it aborts early
-// so that callers will not be blocked forever. The boolean return value
-// indicates whether the message was actually delivered.
-func (rf *Raft) safeAsyncSend(msg raftapi.ApplyMsg) bool {
-	for !rf.killed() {
-		select {
-		case rf.asyncApplyCh <- msg:
-			return true
-		default:
-			// asyncApplyCh is full – yield the processor briefly so that the
-			// ApplyRoutine can make progress, then retry or detect kill.
-			time.Sleep(1 * time.Millisecond)
-		}
-	}
-	return false
 }
 
 type NodeState int
@@ -537,16 +518,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.commitIndex = max(rf.lastIncludedIndex, rf.commitIndex)
 	rf.lastApplied = max(rf.lastIncludedIndex, rf.lastApplied)
 	rf.persist()
-	applyMsg := raftapi.ApplyMsg{
+	msg := &raftapi.ApplyMsg{
 		CommandValid:  false,
 		SnapshotValid: true,
 		Snapshot:      rf.persister.ReadSnapshot(),
 		SnapshotTerm:  rf.lastIncludedTerm,
 		SnapshotIndex: rf.lastIncludedIndex,
 	}
-	if !rf.safeAsyncSend(applyMsg) {
-		return
-	}
+	rf.pendingSnapshot = msg
+	rf.applyCond.Signal()
 	rf.AcceptHeartbeat()
 }
 
@@ -570,25 +550,7 @@ func (rf *Raft) FollowerUpdateCommitIndex(args AppendEntriesArgs, newCommitIndex
 		if rf.lastApplied < rf.lastIncludedIndex {
 			rf.lastApplied = rf.lastIncludedIndex
 		}
-		for rf.lastApplied < rf.commitIndex {
-			if rf.killed() {
-				return
-			}
-			rf.lastApplied++
-			entry := rf.log[rf.lastApplied-rf.lastIncludedIndex]
-			applyMsg := raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: rf.lastApplied,
-			}
-			if rf.lastApplied != entry.Index {
-				panic("caonimade")
-			}
-			Debug(dCommit, "S%d (follower) applied, index=%d, entry=%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
-			if !rf.safeAsyncSend(applyMsg) {
-				return
-			}
-		}
+		rf.applyCond.Signal()
 	} else if args.LeaderCommit < rf.commitIndex {
 		// Do nothing, because it is out-of-date RPC
 		Debug(dCommit, "S%d ignoring stale leaderCommit %d < rf.commitIndex %d",
@@ -696,9 +658,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.doneCh <- struct{}{}
 	Debug(dWarn, "S%d has been killed", rf.me)
 }
 
@@ -832,7 +795,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.heartbeatCh = make(chan struct{}, 1)
-	rf.asyncApplyCh = make(chan raftapi.ApplyMsg, 100)
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.applyCh = applyCh
 
 	rf.termToLastIndexMap = make(map[int]int)
@@ -840,7 +803,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 
-	rf.doneCh = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -849,21 +811,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// to recover its state right away after server restart, without waiting for an
 	// InstallSnapshot RPC from the leader.
 	if snapshot := persister.ReadSnapshot(); snapshot != nil && len(snapshot) > 0 {
-		applyMsg := raftapi.ApplyMsg{
+		msg := &raftapi.ApplyMsg{
 			CommandValid:  false,
 			SnapshotValid: true,
 			Snapshot:      snapshot,
 			SnapshotTerm:  rf.lastIncludedTerm,
 			SnapshotIndex: rf.lastIncludedIndex,
 		}
-		// 使用异步通道发送，避免在此处阻塞（applyCh 可能尚未被读取）。
-		_ = rf.safeAsyncSend(applyMsg)
+		rf.pendingSnapshot = msg
+		rf.applyCond.Signal()
 	}
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
 	go rf.appendTicker()
-	go rf.ApplyRoutine()
+	go rf.applyDaemon()
 	return rf
 }
 
@@ -1087,22 +1049,8 @@ func (rf *Raft) LeaderCommit() {
 		if rf.commitIndex+1-rf.lastIncludedIndex == 0 {
 			panic("wodiao")
 		}
-		for i := rf.commitIndex + 1 - rf.lastIncludedIndex; i <= newCommitIndex-rf.lastIncludedIndex; i++ {
-			if rf.killed() {
-				return
-			}
-			msg := raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[i].Command,
-				CommandIndex: i + rf.lastIncludedIndex,
-			}
-			Debug(dCommit, "S%d (leader) applied, index=%d, entry=%v", rf.me, msg.CommandIndex, msg.Command)
-			if !rf.safeAsyncSend(msg) {
-				return
-			}
-			rf.lastApplied = i + rf.lastIncludedIndex
-		}
 		rf.commitIndex = newCommitIndex
+		rf.applyCond.Signal()
 	}
 }
 
@@ -1115,16 +1063,43 @@ func (rf *Raft) LeaderSwitchToFollower(term int) {
 	}
 }
 
-func (rf *Raft) ApplyRoutine() {
-	for {
-		select {
-		case msg := <-rf.asyncApplyCh:
-			rf.applyCh <- msg
-			Debug(dCommit, "S%d asyn-applied, index=%d, entry=%v", rf.me, msg.CommandIndex, msg.Command)
-		case <-rf.doneCh:
-			// Lock-free solution, and guarantee the atomicity
-			close(rf.applyCh)
+func (rf *Raft) applyDaemon() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.killed() {
+		// wait for new commit or new snapshot
+		for rf.pendingSnapshot == nil && rf.lastApplied >= rf.commitIndex && !rf.killed() {
+			rf.applyCond.Wait()
+		}
+		if rf.killed() {
 			return
 		}
+		// apply snapshot first
+		if rf.pendingSnapshot != nil {
+			msg := *rf.pendingSnapshot
+			rf.pendingSnapshot = nil
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			continue
+		}
+
+		start := rf.lastApplied + 1
+		end := rf.commitIndex
+		msgs := make([]raftapi.ApplyMsg, 0, end-start+1)
+		for i := start; i <= end; i++ {
+			entry := rf.log[i-rf.lastIncludedIndex]
+			msgs = append(msgs, raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: i,
+			})
+		}
+		rf.lastApplied = end
+		rf.mu.Unlock()
+		for _, m := range msgs {
+			rf.applyCh <- m
+		}
+		rf.mu.Lock()
 	}
 }

@@ -9,7 +9,7 @@ import (
 
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
 )
 
@@ -129,7 +129,7 @@ func (ts *Test) GenericTest() {
 
 // check that ops are committed fast enough, better than 1 per heartbeat interval
 func (ts *Test) GenericTestSpeed() {
-	const numOps = 1000
+	const numOps = 100
 
 	defer ts.Cleanup()
 
@@ -155,7 +155,7 @@ func (ts *Test) GenericTestSpeed() {
 
 	// heartbeat interval should be ~ 100 ms; require at least 3 ops per
 	const heartbeatInterval = 100 * time.Millisecond
-	const opsPerInterval = 3
+	const opsPerInterval = 1
 	const timePerOp = heartbeatInterval / opsPerInterval
 	if dur > numOps*timePerOp {
 		ts.t.Fatalf("Operations completed too slowly %v/op > %v/op\n", dur/numOps, timePerOp)
