@@ -220,14 +220,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.persist()
 		rf.commitIndex = max(rf.lastIncludedIndex, rf.commitIndex)
 		rf.lastApplied = max(rf.lastIncludedIndex, rf.lastApplied)
-		// applyMsg := raftapi.ApplyMsg{
-		// 	CommandValid:  false,
-		// 	SnapshotValid: true,
-		// 	Snapshot:      rf.persister.ReadSnapshot(),
-		// 	SnapshotTerm:  rf.lastIncludedTerm,
-		// 	SnapshotIndex: rf.lastIncludedIndex,
-		// }
-		// rf.asyncApplyCh <- applyMsg
 		Debug(dSnap, "S%d created snapshot: index=%d, term=%d, log trimmed from %d to %d entries",
 			rf.me, index, rf.lastIncludedTerm, oldLen, len(rf.log))
 	}
@@ -851,6 +843,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.doneCh = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// 3D: If a snapshot exists in the persistent storage, notify the upper state machine
+	// to restore it immediately at startup. This allows the application layer (like kvserver/rsm)
+	// to recover its state right away after server restart, without waiting for an
+	// InstallSnapshot RPC from the leader.
+	if snapshot := persister.ReadSnapshot(); snapshot != nil && len(snapshot) > 0 {
+		applyMsg := raftapi.ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      snapshot,
+			SnapshotTerm:  rf.lastIncludedTerm,
+			SnapshotIndex: rf.lastIncludedIndex,
+		}
+		// 使用异步通道发送，避免在此处阻塞（applyCh 可能尚未被读取）。
+		_ = rf.safeAsyncSend(applyMsg)
+	}
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()

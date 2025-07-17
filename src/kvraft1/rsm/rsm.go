@@ -1,7 +1,6 @@
 package rsm
 
 import (
-	"log"
 	"sync"
 	"time"
 
@@ -45,7 +44,8 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	pending map[int]*Op
+	pending          map[int]*Op
+	lastAppliedIndex int
 }
 
 // servers[] contains the ports of the set of
@@ -65,11 +65,12 @@ type RSM struct {
 // any long-running work.
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
-		me:           me,
-		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
-		sm:           sm,
-		pending:      make(map[int]*Op),
+		me:               me,
+		maxraftstate:     maxraftstate,
+		applyCh:          make(chan raftapi.ApplyMsg),
+		sm:               sm,
+		pending:          make(map[int]*Op),
+		lastAppliedIndex: 0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -80,7 +81,6 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		panic("useRaftStateMachine is true, but no alternative raft implementation is provided")
 	}
 	go rsm.ApplyChReader()
-	log.Printf("S%d made", rsm.me)
 	return rsm
 }
 
@@ -98,10 +98,22 @@ func (rsm *RSM) ApplyChReader() {
 				close(op.Ch)
 			}
 			rsm.applyCh = nil
-			log.Printf("S%d applyCh killed", rsm.me)
 			rsm.pending = make(map[int]*Op)
 			rsm.mu.Unlock()
 			return
+		}
+		if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
+			rsm.mu.Lock()
+			for idx, op := range rsm.pending {
+				if idx <= msg.SnapshotIndex {
+					delete(rsm.pending, idx)
+					close(op.Ch)
+				}
+			}
+			rsm.mu.Unlock()
+			rsm.lastAppliedIndex = msg.SnapshotIndex
+			continue
 		}
 		if !msg.CommandValid {
 			continue
@@ -109,6 +121,7 @@ func (rsm *RSM) ApplyChReader() {
 		req := msg.Command
 		// DoOp first
 		result := rsm.sm.DoOp(req)
+		rsm.lastAppliedIndex = msg.CommandIndex
 		// Need to check if raft still in the term and leader state when command submited
 		rsm.mu.Lock()
 		op, exist := rsm.pending[msg.CommandIndex]
@@ -119,6 +132,11 @@ func (rsm *RSM) ApplyChReader() {
 			op.Ch <- result
 		}
 		rsm.mu.Unlock()
+
+		if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > rsm.maxraftstate {
+			data := rsm.sm.Snapshot()
+			rsm.rf.Snapshot(rsm.lastAppliedIndex, data)
+		}
 	}
 }
 

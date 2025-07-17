@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,6 @@ type KVServer struct {
 	// Your definitions here.
 	mu    sync.Mutex
 	kvMap map[string]ValueVersionPair
-	locks map[string]*sync.Mutex
 }
 
 type ValueVersionPair struct {
@@ -35,7 +35,8 @@ type ValueVersionPair struct {
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
-
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	switch r := req.(type) {
 	case rpc.GetArgs:
 		{
@@ -94,11 +95,32 @@ func (kv *KVServer) DoOp(req any) any {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(kv.kvMap); err != nil {
+		log.Fatalf("encode snapshot: %v", err)
+	}
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	if data == nil || len(data) == 0 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var m map[string]ValueVersionPair = make(map[string]ValueVersionPair)
+	if err := d.Decode(&m); err != nil {
+		log.Fatalf("decode snapshot: %v", err)
+	}
+	kv.kvMap = m
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -169,12 +191,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(ValueVersionPair{})
 
 	kv := &KVServer{me: me}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	kv.kvMap = make(map[string]ValueVersionPair)
-	kv.locks = make(map[string]*sync.Mutex)
 	// You may need initialization code here.
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
