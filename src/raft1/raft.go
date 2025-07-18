@@ -344,7 +344,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			reply.ConflictTerm = -1
-			reply.ConflictFirstIndex = rf.lastIncludedIndex
+			reply.ConflictFirstIndex = rf.lastIncludedIndex + 1
 			Debug(dLog, "S%d rejected heartbeat: prevLogIndex %d < lastIncludedIndex %d", rf.me, args.PrevLogIndex, rf.lastIncludedIndex)
 			rf.AcceptHeartbeat()
 			return
@@ -404,7 +404,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			reply.ConflictTerm = -1
-			reply.ConflictFirstIndex = rf.lastIncludedIndex
+			reply.ConflictFirstIndex = rf.lastIncludedIndex + 1
+			// This ConflictFirstIndex will be set as nextIndex
+			// Thus,
 			Debug(dLog, "S%d rejected append entries: prevLogIndex %d < lastIncludedIndex %d", rf.me, args.PrevLogIndex, rf.lastIncludedIndex)
 			rf.AcceptHeartbeat()
 			return
@@ -412,7 +414,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			reply.ConflictTerm = -1
-			reply.ConflictFirstIndex = len(rf.log)
+			reply.ConflictFirstIndex = len(rf.log) + rf.lastIncludedIndex
 			Debug(dLog, "S%d rejected append entries: prevLogIndex %d >= log length %d", rf.me, args.PrevLogIndex, len(rf.log))
 			rf.AcceptHeartbeat()
 			return
