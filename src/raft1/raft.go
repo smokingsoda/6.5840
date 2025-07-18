@@ -441,15 +441,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// delete the existing entry and all that follow it (§5.3)
 			if args.Entries[0].Index-rf.lastIncludedIndex < len(rf.log) {
 				// Conflict found, truncate log
+				// First we should find the conflict index
 				oldLen := len(rf.log)
-				rf.log = rf.log[:args.Entries[0].Index-rf.lastIncludedIndex]
-				rf.persist()
-				Debug(dLog2, "S%d found conflict at index %d, truncated log from %d to %d",
-					rf.me, args.Entries[0].Index, oldLen, len(rf.log))
-			} else if args.Entries[0].Index-rf.lastIncludedIndex >= len(rf.log) {
-				if args.Entries[0].Index-rf.lastIncludedIndex > len(rf.log) {
-					panic("aaa")
+				conflictAbsoluteIndex := args.Entries[0].Index
+				conflictRelativeIndex := 0
+				for i := range args.Entries {
+					absoluteIndex := args.Entries[i].Index
+					if absoluteIndex-rf.lastIncludedIndex >= len(rf.log) || args.Entries[i].Term != rf.log[absoluteIndex-rf.lastIncludedIndex].Term {
+						conflictAbsoluteIndex = absoluteIndex
+						conflictRelativeIndex = i
+						break
+					}
 				}
+				if conflictAbsoluteIndex-rf.lastIncludedIndex < len(rf.log) {
+					// TestFigure8Unreliable3C: If we can't find a conflict entry within the args.Entries
+					// we should not do nothing
+					rf.log = rf.log[:conflictAbsoluteIndex-rf.lastIncludedIndex]
+					rf.persist()
+					rf.log = append(rf.log, args.Entries[conflictRelativeIndex:]...)
+					rf.persist()
+					Debug(dLog2, "S%d found conflict at index %d, truncated log from %d to %d",
+						rf.me, args.Entries[conflictRelativeIndex].Index, oldLen, len(rf.log))
+				} else {
+					rf.log = append(rf.log, args.Entries[conflictRelativeIndex:]...)
+					rf.persist()
+					if len(rf.log) == oldLen {
+						Debug(dLog2, "S%d no conflict no new entries, truncated log from %d to %d",
+							rf.me, oldLen, len(rf.log))
+					} else {
+						Debug(dLog2, "S%d no conflict but new index=%d, truncated log from %d to %d",
+							rf.me, args.Entries[conflictRelativeIndex].Index, oldLen, len(rf.log))
+					}
+				}
+			} else if args.Entries[0].Index-rf.lastIncludedIndex > len(rf.log) {
+				panic("aaa")
 				// oldLen := len(rf.log)
 				// rf.log = rf.log[:args.Entry.Index]
 				// rf.persist()
@@ -457,9 +482,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// 	rf.me, args.Entry.Index, oldLen, len(rf.log))
 				// fmt.Println(dLog2, "S%d found log longer after index %d, truncated log from %d to %d",
 				// 	rf.me, args.Entry.Index, oldLen, len(rf.log))
-			}
-			// Append new entry
-			if args.Entries[0].Index-rf.lastIncludedIndex == len(rf.log) {
+			} else if args.Entries[0].Index-rf.lastIncludedIndex == len(rf.log) {
 				reply.Success = true
 				rf.log = append(rf.log, args.Entries...)
 				rf.persist()
@@ -470,6 +493,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 				newCommitIndex := min(args.LeaderCommit, len(rf.log)-1+rf.lastIncludedIndex)
 				rf.FollowerUpdateCommitIndex(*args, newCommitIndex)
+			} else {
+				panic("AppendEntries: unreachable")
 			}
 			rf.AcceptHeartbeat()
 			return
@@ -643,8 +668,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		rf.matchIndex[rf.me] = len(rf.log) - 1 + rf.lastIncludedIndex
 		index = len(rf.log) - 1 + rf.lastIncludedIndex
-		Debug(dLog, "S%d (leader) appended new entry at index %d, term %d, log length now %d",
-			rf.me, index, term, len(rf.log))
+		Debug(dLog, "S%d (leader) appended new entry%v at index %d, term %d, log length now %d",
+			rf.me, rf.log[len(rf.log)-1], index, term, len(rf.log))
 		Debug(dLog, "S%d (leader) new entry added, will be replicated by heartbeat mechanism",
 			rf.me)
 		// Optimization: Don't send immediately, let heartbeat mechanism handle all log replication
@@ -985,13 +1010,13 @@ func (rf *Raft) LeaderHandleReply(follower int, args AppendEntriesArgs, reply Ap
 			panic(fmt.Sprintf("S%d (leader) args.PrevLogIndex=%d, rf.nextIndex[%d]-1=%d", rf.me, args.PrevLogIndex, follower, rf.nextIndex[follower]-1))
 		}
 		if args.Entries[0] == EmptyLogEntry {
-			rf.matchIndex[follower] = args.PrevLogIndex
+			rf.matchIndex[follower] = max(args.PrevLogIndex, rf.matchIndex[follower])
 			rf.nextIndex[follower] = rf.matchIndex[follower] + 1
 			if rf.nextIndex[follower]-rf.lastIncludedIndex > len(rf.log) {
 				panic("cuowu")
 			}
 		} else if args.Entries[0] != EmptyLogEntry && rf.nextIndex[follower] < len(rf.log)+rf.lastIncludedIndex {
-			rf.matchIndex[follower] = args.PrevLogIndex + len(args.Entries)
+			rf.matchIndex[follower] = max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[follower])
 			rf.nextIndex[follower] = rf.matchIndex[follower] + 1
 			Debug(dLeader, "S%d (leader) updated S%d nextIndex to %d", rf.me, follower, rf.nextIndex[follower])
 			Debug(dLeader, "S%d (leader) updated S%d matchIndex to %d", rf.me, follower, rf.matchIndex[follower])
@@ -1038,7 +1063,7 @@ func (rf *Raft) LeaderHandleSnapshotRPC(follower int, args InstallSnapshotArgs, 
 		return
 	}
 	oldNextIndex := rf.nextIndex[follower]
-	rf.matchIndex[follower] = args.LastIncludedIndex
+	rf.matchIndex[follower] = max(args.LastIncludedIndex, rf.matchIndex[follower])
 	rf.nextIndex[follower] = rf.matchIndex[follower] + 1
 	Debug(dSnap, "S%d updated S%d indices after snapshot: nextIndex %d->%d, matchIndex->%d",
 		rf.me, follower, oldNextIndex, rf.nextIndex[follower], rf.matchIndex[follower])
